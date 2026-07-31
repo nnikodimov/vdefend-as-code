@@ -8,25 +8,27 @@
 
 ## Abstract
 
-VMware Cloud Foundation (VCF) 9's VPC (Virtual Private Cloud) model exposes NSX networking and **vDefend** security — Distributed Firewall (micro-segmentation), VPC Gateway Firewall, and Transit Gateway Firewall — as declarative Kubernetes-style custom resources through VCF Automation's **Cloud Consumption Interface (CCI)**, under the `vpc.nsx.vmware.com/v1alpha1` API group. This turns tenant security configuration from a series of NSX Manager UI clicks into version-controlled, reviewable, and automatable code. This paper focuses on the five resource kinds that carry that security model — **`NetworkSecurityGroup`**, **`SecurityProfile`**, **`FirewallPolicy`**, **`VPCGatewayFirewallPolicy`**, and **`TGWFirewallPolicy`** — and presents two production-grade automation patterns against them: **Terraform** (apply-time infrastructure-as-code) and **Argo CD** (continuous GitOps reconciliation), including a worked multi-tier tenant onboarding example with runnable code.
+VMware Cloud Foundation (VCF) 9's VPC (Virtual Private Cloud) model exposes VCF Networking and **vDefend** security — Distributed Firewall (micro-segmentation), VPC Gateway Firewall, and Transit Gateway Firewall — as declarative Kubernetes-style custom resources through VCF Automation's **Cloud Consumption Interface (CCI)**, under the `vpc.nsx.vmware.com/v1alpha1` API group. This turns tenant security configuration from a series of point-and-click console workflows into version-controlled, reviewable, and automatable code. This paper focuses on the five resource kinds that carry that security model — **`NetworkSecurityGroup`**, **`SecurityProfile`**, **`FirewallPolicy`**, **`VPCGatewayFirewallPolicy`**, and **`TGWFirewallPolicy`** — plus seven closely related supporting kinds surfaced by the verified schema (**`VPCNetworkSecurityGroup`**, **`SecurityProfileAttachment`**, **`NetworkService`**, **`NetworkSecurityGroupIPMembers`**/**`VPCNetworkSecurityGroupIPMembers`**, **`SecurityStrategy`**, **`TGWSecurityConfig`**, **`VPCConnectivityProfile`**/**`VPCConnectivityProfileBinding`**, and **`RegionNetworkingCapabilities`**) — and presents two production-grade automation patterns against them: **Terraform** (apply-time infrastructure-as-code) and **Argo CD** (continuous GitOps reconciliation), including a worked multi-tier tenant onboarding example with runnable code.
 
-> **Accuracy note:** The Broadcom Developer Portal's interactive API reference for `xapis/cci-api` (`vpc.nsx.vmware.com/v1alpha1`) renders as a JavaScript single-page app; automated retrieval of its raw schema was not possible while researching this paper, so exact field names below are reconstructed from Broadcom's published NSX VPC administration guides (Groups in an NSX VPC, Firewall Policies in an NSX VPC, VPC Security Profile status/API, VPC Connectivity Policies) rather than copied verbatim from the Swagger definitions. The **resource kinds, their purpose, and their relationships to each other are accurate**; treat the exact spec field names in the YAML examples as representative and confirm them against your environment with `kubectl explain <kind> --api-version=vpc.nsx.vmware.com/v1alpha1` or the live Swagger UI before committing production manifests.
+> **Accuracy note (verified 2026-07-31):** The resource shapes, field names, and required fields below were checked directly against the Broadcom Developer Portal's raw HTML for the `xapis/cci-api` reference (`vpc.nsx.vmware.com/v1alpha1`) — the earlier draft of this paper reconstructed field names from administration-guide prose and got several of them wrong. Two corrections worth flagging up front: (1) `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` rules use `from`/`to` arrays of single-peer objects (`{ groupName }` or `{ ipAddress }`), not flat `sourceGroups`/`destinationGroups` string lists, and port/protocol matching nests under `services[].l4PortSet`, not flat on the rule; (2) there is no `spec.securityProfile` field on any firewall policy kind — a `SecurityProfile` only takes effect once bound to a VPC through a separate `SecurityProfileAttachment` object. See §3 for the full corrected shapes, and still confirm against your own build with `kubectl explain <kind> --api-version=vpc.nsx.vmware.com/v1alpha1` before committing production manifests, since API versions evolve.
 
 ---
 
 ## 1. Executive Summary
 
-Traditionally, configuring per-tenant network security in an NSX-backed private cloud meant a security admin logging into NSX Manager, building Groups and DFW/gateway firewall rules by hand, and hoping change control caught drift. VCF Automation's CCI changes this by projecting a VPC's entire security model — group membership, firewall behavior toggles, and firewall rules at three distinct enforcement points — as Kubernetes custom resources scoped to a **Supervisor Namespace** inside a tenant **Project**. Because these are ordinary Kubernetes objects behind a standard API server, every mainstream infrastructure-as-code and GitOps tool works against them without a bespoke integration.
+Traditionally, configuring per-tenant network security in a VCF private cloud meant a security admin logging into a management console, building Groups and DFW/gateway firewall rules by hand, and hoping change control caught drift. VCF Automation's CCI changes this by projecting a VPC's entire security model — group membership, firewall behavior toggles, and firewall rules at three distinct enforcement points — as Kubernetes custom resources scoped to a **Supervisor Namespace** inside a tenant **Project**. Because these are ordinary Kubernetes objects behind a standard API server, every mainstream infrastructure-as-code and GitOps tool works against them without a bespoke integration.
 
-The five resource kinds this paper focuses on map directly onto NSX's three real enforcement points inside and around a VPC:
+The five resource kinds this paper focuses on map directly onto the VPC's three real enforcement points inside and around it:
 
 | Resource kind | Enforcement point | Analogous to |
 |---|---|---|
-| `NetworkSecurityGroup` | N/A — reusable membership object | An NSX Group, scoped to a VPC |
-| `SecurityProfile` | N/A — cross-cutting policy-mode object | The NSX `VpcSecurityProfile` (e.g. north-south firewall on/off, TCP-strict mode) |
+| `NetworkSecurityGroup` | N/A — reusable, region-scoped membership object | A region-scoped Group, referenced by `FirewallPolicy` and `TGWFirewallPolicy` |
+| `SecurityProfile` | N/A — cross-cutting policy-mode object | A per-VPC security posture (north-south firewall on/off, east-west isolation strategy), only live once bound to a VPC via `SecurityProfileAttachment` |
 | `FirewallPolicy` | East-west, intra-VPC | The Distributed Firewall (micro-segmentation) |
 | `VPCGatewayFirewallPolicy` | North-south, per-VPC perimeter | The VPC's Gateway Firewall |
 | `TGWFirewallPolicy` | East-west, inter-VPC | Transit Gateway firewalling / VPC Connectivity Policies |
+
+Several supporting kinds round out the picture once you check the live schema: **`VPCNetworkSecurityGroup`** is a VPC-scoped sibling of `NetworkSecurityGroup` that `VPCGatewayFirewallPolicy` rules reference instead of the region-scoped kind; **`SecurityProfileAttachment`** is the object that actually binds a `SecurityProfile` to a given VPC; **`NetworkService`** is a reusable, named protocol/port definition any firewall rule can reference instead of inlining `l4PortSet`; **`NetworkSecurityGroupIPMembers`**/**`VPCNetworkSecurityGroupIPMembers`** are read-only subresources exposing a group's *realized* member IPs — a natural CI validation gate; **`SecurityStrategy`** defines a reusable, named bundle of firewall rule templates; **`TGWSecurityConfig`** is the master on/off switch that must enable `GatewayFirewall` on a Transit Gateway before any `TGWFirewallPolicy` attached to it does anything; **`VPCConnectivityProfile`**/**`VPCConnectivityProfileBinding`** govern a VPC's north-south IP-block, Transit Gateway attachment, and NAT posture; and **`RegionNetworkingCapabilities`** is a read-only, per-region capability map worth checking before generating manifests that depend on a feature a given region may not support. All are covered alongside their parent kinds in §3.
 
 This gives platform teams two complementary automation levers:
 
@@ -49,7 +51,7 @@ CCI is the Kubernetes-style consumption layer of VCF Automation. Instead of a pr
 | `infrastructure.cci.vmware.com/v1alpha1-3` | Namespace classes, quotas, zone/region association — the guardrails a provider admin sets before a tenant gets self-service access |
 | `authorization.cci.vmware.com/v1alpha1` | RBAC / role bindings scoped to a Project or namespace |
 | `topology.cci.vmware.com/v1alpha1-2` | Region/zone/supervisor topology |
-| `vpc.nsx.vmware.com/v1alpha1` | **VPC networking and vDefend security**: `VPC`, `Subnet`, `NetworkSecurityGroup`, `SecurityProfile`, `FirewallPolicy`, `VPCGatewayFirewallPolicy`, `TGWFirewallPolicy` |
+| `vpc.nsx.vmware.com/v1alpha1` | **VPC networking and vDefend security**: `VPC`, `Subnet`, `NetworkSecurityGroup`/`VPCNetworkSecurityGroup` (+ their `IPMembers` subresources), `NetworkService`, `SecurityProfile`, `SecurityProfileAttachment`, `SecurityStrategy`, `FirewallPolicy`, `VPCGatewayFirewallPolicy`, `TGWFirewallPolicy`, `TGWSecurityConfig`, `VPCConnectivityProfile`/`VPCConnectivityProfileBinding`, `RegionNetworkingCapabilities` |
 | `vmoperator.vmware.com/v1alpha3` | VM lifecycle (the workloads the security policy protects) |
 
 ### 2.2 Multi-tenancy hierarchy
@@ -57,7 +59,7 @@ CCI is the Kubernetes-style consumption layer of VCF Automation. Instead of a pr
 ```
 Provider Admin
    └─ Region (group of Supervisors)
-        └─ Project  (tenant boundary; maps to an NSX Project)
+        └─ Project  (tenant boundary)
              └─ Supervisor Namespace  (== a VPC-backed namespace)
                   ├─ VPC                       (vpc.nsx.vmware.com/v1alpha1)
                   │    ├─ Subnet(s)
@@ -73,13 +75,13 @@ A **Project** is the tenant. Everything a tenant can self-service — including 
 
 ### 2.3 vDefend security constructs surfaced through the VPC
 
-vDefend is Broadcom's NSX-native security suite. Inside a VPC, its three enforcement points are:
+vDefend is Broadcom's security suite built into VCF Networking. Inside a VPC, its three enforcement points are:
 
-- **Distributed Firewall (micro-segmentation)** — east-west enforcement at each workload's vNIC *within* a VPC, driven by `FirewallPolicy` objects that reference `NetworkSecurityGroup`s as source/destination. This is the primary object tenants author to isolate application tiers (e.g., only the app tier may talk to the DB tier on 5432).
-- **VPC Gateway Firewall** — stateful north-south perimeter enforcement at the VPC's own gateway, driven by `VPCGatewayFirewallPolicy`. NSX creates a default allow-all north-south rule per VPC; tenants are expected to add explicit `VPCGatewayFirewallPolicy` rules to restrict what can enter or leave the VPC boundary.
-- **Transit Gateway Firewall (inter-VPC)** — east-west enforcement *between* VPCs that share a Transit Gateway, driven by `TGWFirewallPolicy`. This is the granular complement to the coarser Community/Isolated/Promiscuous VPC Connectivity Policies, letting a platform team carve out precise exceptions (e.g., "a shared-services VPC may reach any tenant VPC on port 443 only").
-- **`SecurityProfile`** is not itself an enforcement point but the cross-cutting object that controls *how* the above behave for a given VPC — e.g., whether the VPC's north-south firewall is enabled at all, and whether TCP-strict mode is on.
-- **IDS/IPS and Malware Prevention for vDefend** layer on top of these firewall rules as additional detection/prevention profiles (distributed or gateway-based); where exposed via CCI, they attach as profile references on `SecurityProfile` or the relevant `FirewallPolicy`/`VPCGatewayFirewallPolicy` object.
+- **Distributed Firewall (micro-segmentation)** — east-west enforcement at each workload's vNIC *within* a VPC, driven by `FirewallPolicy` objects whose rules reference `NetworkSecurityGroup`s as source/destination peers. This is the primary object tenants author to isolate application tiers (e.g., only the app tier may talk to the DB tier on 5432).
+- **VPC Gateway Firewall** — stateful north-south perimeter enforcement at the VPC's own gateway, driven by `VPCGatewayFirewallPolicy`. VCF Networking creates a default allow-all north-south rule per VPC; tenants are expected to add explicit `VPCGatewayFirewallPolicy` rules to restrict what can enter or leave the VPC boundary.
+- **Transit Gateway Firewall (inter-VPC)** — east-west enforcement *between* VPCs that share a Transit Gateway, driven by `TGWFirewallPolicy`, letting a platform team carve out precise exceptions (e.g., "a shared-services VPC may reach any tenant VPC on port 443 only") on top of the coarser connectivity posture set by `VPCConnectivityProfile` (§3.11). It has its own on/off master switch: a `TGWFirewallPolicy` enforces nothing until the referenced Transit Gateway's `TGWSecurityConfig` enables the `GatewayFirewall` feature (§3.10).
+- **`SecurityProfile`** is not itself an enforcement point but the cross-cutting object that controls *how* the above behave for a given VPC — specifically, whether the VPC's north-south (gateway) firewall is enabled at all (`northSouthFirewall.enabled`) and which east-west micro-segmentation strategy applies (`eastWestFirewall.securityStrategies`, e.g. `vpc-isolation`). It only takes effect once bound to a VPC via a separate `SecurityProfileAttachment` object — see §3.2. TCP-strict handshake enforcement (`tcpStrict`) is actually a per-policy field on each `FirewallPolicy`/`VPCGatewayFirewallPolicy`/`TGWFirewallPolicy`, not on `SecurityProfile`.
+- **IDS/IPS and Malware Prevention for vDefend** layer on top of these firewall rules as additional detection/prevention capability. As of the verified `vpc.nsx.vmware.com/v1alpha1` schema, this attachment is **not** exposed as a field on `SecurityProfile` or the firewall policy kinds covered here — treat it as configured outside these objects (e.g. via the platform admin console) until it lands in this API group.
 
 Automating "tenant vDefend security" in practice means automating these five resource kinds — declaratively, reviewably, in Git.
 
@@ -87,9 +89,14 @@ Automating "tenant vDefend security" in practice means automating these five res
 
 ## 3. The vDefend Security Resources in `vpc.nsx.vmware.com/v1alpha1`
 
-### 3.1 `NetworkSecurityGroup` — the reusable "who"
+### 3.1 `NetworkSecurityGroup` / `VPCNetworkSecurityGroup` — the reusable "who"
 
-The Kubernetes-native mirror of an NSX VPC Group: a named, reusable set of workloads or addresses, defined by membership criteria rather than static IPs. `FirewallPolicy`, `VPCGatewayFirewallPolicy`, and `TGWFirewallPolicy` rules reference groups by name instead of embedding selectors inline — this indirection is what lets a tenant build a stable "web-tier / app-tier / db-tier" vocabulary once and reuse it across every policy that needs it.
+The Kubernetes-native mirror of a Group: a named, reusable set of workloads or addresses, defined by membership criteria rather than static IPs. The verified schema splits this into **two** kinds, scoped differently, and each firewall kind reaches for the one that matches its own scope:
+
+- **`NetworkSecurityGroup`** is scoped by a required `spec.regionName` (not a VPC). `FirewallPolicy` (east-west/DFW) and `TGWFirewallPolicy` (inter-VPC) rules reference these by name.
+- **`VPCNetworkSecurityGroup`** is scoped by a required `spec.vpcName` instead. `VPCGatewayFirewallPolicy` (north-south perimeter) rules reference these instead of the region-scoped kind.
+
+Both kinds share the same membership shape: static `ipAddresses[]` (single IPs, ranges, or CIDRs), static `vms[]` (by `instanceUUID`), dynamic `vmSelectors[]` / `podSelectors[]` (each a `labelSelector` and/or `namespaceSelector`, plus a VM-only `propertySelector` matching on `Name`/`OSName`/`ComputerName`), and nested group references (`networkSecurityGroupNames[]` or `vpcNetworkSecurityGroupNames[]`, respectively). There is no `memberSelector` wrapper object — these are all top-level `spec` fields.
 
 ```yaml
 apiVersion: vpc.nsx.vmware.com/v1alpha1
@@ -98,10 +105,11 @@ metadata:
   name: acme-app-tier
   namespace: acme-prod-ns01
 spec:
-  memberSelector:
-    vmSelector:
-      matchLabels:
-        tier: app
+  regionName: region-a
+  vmSelectors:
+    - labelSelector:
+        matchLabels:
+          tier: app
 ---
 apiVersion: vpc.nsx.vmware.com/v1alpha1
 kind: NetworkSecurityGroup
@@ -109,31 +117,57 @@ metadata:
   name: acme-corp-admin-cidrs
   namespace: acme-prod-ns01
 spec:
-  memberSelector:
-    ipAddresses:
-      - 10.100.0.0/24
+  regionName: region-a
+  ipAddresses:
+    - "10.100.0.0/24"
+---
+apiVersion: vpc.nsx.vmware.com/v1alpha1
+kind: VPCNetworkSecurityGroup
+metadata:
+  name: acme-web-tier-vpc
+  namespace: acme-prod-ns01
+spec:
+  vpcName: acme-prod-vpc01
+  vmSelectors:
+    - labelSelector:
+        matchLabels:
+          tier: web
 ```
 
-### 3.2 `SecurityProfile` — the VPC's security posture
+### 3.2 `SecurityProfile` + `SecurityProfileAttachment` — the VPC's security posture
 
-Confirmed at the NSX Policy API level as `VpcSecurityProfile` (fields observed: `is_default`, `north_south_firewall.enabled`, `display_name`), this object controls VPC-wide enforcement behavior rather than individual rules — whether the Gateway Firewall is active at all, stateful/TCP-strict behavior, and (where licensed) which IDS/IPS or Malware Prevention profile applies.
+`SecurityProfile` is a standalone, `regionName`-scoped object — it does nothing on its own. A separate **`SecurityProfileAttachment`** object (`regionName` + `securityProfileName` + `vpcName`, all required) is what actually binds it to a VPC. `SecurityProfileSpec` itself controls VPC-wide enforcement behavior rather than individual rules: whether the north-south (gateway) firewall is enabled at all, and which east-west micro-segmentation strategy the VPC runs. There is no `tcpStrict` field here (that lives on each firewall policy kind, §3.3–3.5) and no IDS/IPS or Malware Prevention profile reference field in this API group.
 
 ```yaml
 apiVersion: vpc.nsx.vmware.com/v1alpha1
 kind: SecurityProfile
 metadata:
-  name: acme-vpc-security-profile
+  name: acme-security-profile
   namespace: acme-prod-ns01
 spec:
+  regionName: region-a
+  isDefault: false                # required
   northSouthFirewall:
     enabled: true
-  tcpStrict: true
-  idsIpsProfile: default-standard-detection   # vDefend ATP, if licensed
+  eastWestFirewall:
+    securityStrategies:
+      - vpc-isolation              # one of: none, vpc-isolation, vpc-secure-connection,
+                                   # vpc-isolation-with-essential-services, vpc-external-connectivity
+---
+apiVersion: vpc.nsx.vmware.com/v1alpha1
+kind: SecurityProfileAttachment
+metadata:
+  name: acme-security-profile-attachment
+  namespace: acme-prod-ns01
+spec:
+  regionName: region-a
+  securityProfileName: acme-security-profile
+  vpcName: acme-prod-vpc01
 ```
 
 ### 3.3 `FirewallPolicy` — east-west (Distributed Firewall) rules
 
-The general-purpose, intra-VPC micro-segmentation policy. Holds an ordered `rules[]` list where each rule's source/destination reference `NetworkSecurityGroup` names.
+The general-purpose, intra-VPC micro-segmentation policy. Holds an ordered `rules[]` list; each rule's `from`/`to` are arrays of **single-peer objects** (`{ groupName: <NetworkSecurityGroup name> }` or `{ ipAddress: <CIDR/IP> }`), not flat string lists, and port/protocol matching nests under `services[].l4PortSet` (or a `networkServiceName` reference to a reusable `NetworkService` object) rather than sitting flat on the rule.
 
 ```yaml
 apiVersion: vpc.nsx.vmware.com/v1alpha1
@@ -142,36 +176,46 @@ metadata:
   name: acme-tier-isolation
   namespace: acme-prod-ns01
 spec:
-  securityProfile: acme-vpc-security-profile
+  regionName: region-a           # required
+  category: Application          # Infrastructure | Environment | Application
+  stateful: true
+  tcpStrict: true
   rules:
     - name: allow-web-to-app
       direction: IN
       action: ALLOW
-      sourceGroups: [acme-web-tier]
-      destinationGroups: [acme-app-tier]
+      from:
+        - groupName: acme-web-tier
+      to:
+        - groupName: acme-app-tier
       services:
-        - protocol: TCP
-          destinationPorts: ["8443"]
+        - l4PortSet:
+            l4Protocol: TCP
+            destinationPorts: ["8443"]
     - name: deny-all-app-inbound
       direction: IN
       action: DROP
-      destinationGroups: [acme-app-tier]
+      to:
+        - groupName: acme-app-tier
 ```
 
 Key fields:
 
 | Field | Purpose |
 |---|---|
-| `spec.securityProfile` | Reference to the `SecurityProfile` governing this policy's enforcement mode |
-| `spec.rules[].direction` | `IN` / `OUT` |
-| `spec.rules[].action` | `ALLOW` / `DROP` / `REJECT` |
-| `spec.rules[].sourceGroups` / `destinationGroups` | Lists of `NetworkSecurityGroup` names — the label-based micro-segmentation building blocks |
-| `spec.rules[].services` | Protocol/port match (with a port range field for ranges) |
-| Rule order | Rules evaluate top-to-bottom within a `FirewallPolicy`; policy-to-policy ordering follows a priority/category field on the policy itself |
+| `spec.regionName` | **Required.** Region the policy is placed in; cannot change after creation. There is no `spec.securityProfile` field — VPC posture is set separately via `SecurityProfile`/`SecurityProfileAttachment` (§3.2). |
+| `spec.category` | One of `Infrastructure`, `Environment`, `Application` — used to classify and order the policy relative to others. |
+| `spec.stateful` / `spec.tcpStrict` | Per-policy connection tracking and 3-way-handshake enforcement. |
+| `spec.appliedTo.groupNames[]` | Policy-level scoping; takes precedence over any rule-level `appliedTo`. |
+| `spec.connectivityPreference` / `spec.applicationConnectivityStrategy[]` | Present only on `FirewallPolicySpec` (not on `TGWFirewallPolicySpec`/`VPCGatewayFirewallPolicySpec`). Likely where a Community/Isolated/Promiscuous-style default-connectivity posture actually lives — `VPCConnectivityProfile` (§3.11) does **not** expose such a field — but accepted values aren't documented here; confirm with `kubectl explain` before relying on it. |
+| `spec.rules[].direction` / `action` | Free-form strings in the reference (e.g. `IN`/`OUT`, `ALLOW`/`DROP`/`REJECT` by Distributed Firewall convention) — not documented as a strict enum in this API reference, so confirm the exact accepted values with `kubectl explain` against your build. |
+| `spec.rules[].from[]` / `to[]` | Each entry is **one** peer: `{ groupName }` referencing a `NetworkSecurityGroup`, or `{ ipAddress }`. Omit for "Any"; set `sourcesExcluded`/`destinationsExcluded: true` to invert into an exclusion list. |
+| `spec.rules[].services[]` | Each entry is `{ l4PortSet: { l4Protocol, destinationPorts[], sourcePorts[] } }` or `{ networkServiceName }`. Omit for "Any". |
+| Rule order | Rules evaluate top-to-bottom within a `FirewallPolicy`; `spec.priority` resolves conflicts across policies in the same category. |
 
 ### 3.4 `VPCGatewayFirewallPolicy` — north-south perimeter rules
 
-Same rule shape as `FirewallPolicy`, but scoped to the VPC's own gateway rather than to workload vNICs — this is the object a tenant edits to control what's allowed to enter or leave their VPC boundary.
+Same rule shape as `FirewallPolicy` (`from`/`to`/`services` all identical), but scoped to the VPC's own gateway rather than to workload vNICs, and it references **`VPCNetworkSecurityGroup`** (not `NetworkSecurityGroup`) in its `groupName` peers. Both `spec.regionName` and `spec.vpcName` are required — easy to miss since they carry no default.
 
 ```yaml
 apiVersion: vpc.nsx.vmware.com/v1alpha1
@@ -180,14 +224,19 @@ metadata:
   name: acme-perimeter
   namespace: acme-prod-ns01
 spec:
+  regionName: region-a            # required
+  vpcName: acme-prod-vpc01        # required
+  category: LocalGatewayRules     # LocalGatewayRules | Default
   rules:
     - name: allow-inbound-https
       direction: IN
       action: ALLOW
-      destinationGroups: [acme-web-tier]
+      to:
+        - groupName: acme-web-tier-vpc   # a VPCNetworkSecurityGroup
       services:
-        - protocol: TCP
-          destinationPorts: ["443"]
+        - l4PortSet:
+            l4Protocol: TCP
+            destinationPorts: ["443"]
     - name: deny-all-other-inbound
       direction: IN
       action: DROP
@@ -195,7 +244,7 @@ spec:
 
 ### 3.5 `TGWFirewallPolicy` — inter-VPC rules on a shared Transit Gateway
 
-Applies where a tenant's (or the platform's) VPCs are attached to a common Transit Gateway and need finer control than the blunt Community/Isolated/Promiscuous connectivity posture — e.g., allowing a shared-services VPC to reach specific tenant VPCs on specific ports while otherwise remaining isolated. Note this capability requires the appropriate vDefend/Advanced Cyber Compliance licensing tier.
+Applies where a tenant's (or the platform's) VPCs are attached to a common Transit Gateway and need finer control than the blunt Community/Isolated/Promiscuous connectivity posture. **There is no `spec.transitGateway` field** — the verified schema has no such reference on `TGWFirewallPolicySpec`. Instead, a rule scopes itself to a specific Transit Gateway attachment through its own `appliedTo.gatewayAttachmentNames[]` / `gatewayNames[]` (fields that only apply to this policy kind; `appliedTo.groupNames[]` is the Distributed-Firewall-only equivalent). Groups referenced in `from`/`to` here are the region-scoped `NetworkSecurityGroup`, same as `FirewallPolicy`. Note this capability requires the appropriate vDefend/Advanced Cyber Compliance licensing tier.
 
 ```yaml
 apiVersion: vpc.nsx.vmware.com/v1alpha1
@@ -204,32 +253,145 @@ metadata:
   name: acme-shared-services-access
   namespace: acme-prod-ns01
 spec:
-  transitGateway: corp-shared-tgw
+  regionName: region-a            # required
+  category: Default                # LocalGatewayRules | Default
   rules:
     - name: allow-shared-services-to-acme
       direction: IN
       action: ALLOW
-      sourceGroups: [shared-services-vpc-egress]
-      destinationGroups: [acme-app-tier]
+      appliedTo:
+        gatewayAttachmentNames: [acme-prod-tgw-attachment]
+      from:
+        - groupName: shared-services-vpc-egress
+      to:
+        - groupName: acme-app-tier
       services:
-        - protocol: TCP
-          destinationPorts: ["443"]
+        - l4PortSet:
+            l4Protocol: TCP
+            destinationPorts: ["443"]
     - name: deny-other-vpcs
       direction: IN
       action: DROP
 ```
 
-### 3.6 How the five kinds compose
+### 3.6 How the kinds compose
 
 ```
-NetworkSecurityGroup  ──referenced by──▶  FirewallPolicy (east-west, intra-VPC)
-        ▲                                  VPCGatewayFirewallPolicy (north-south)
-        │                                  TGWFirewallPolicy (east-west, inter-VPC)
-        │
-SecurityProfile  ──governs enforcement mode of──▶  all of the above within a VPC
+NetworkSecurityGroup (regionName)     ──referenced by──▶  FirewallPolicy (east-west, intra-VPC)
+                                                            TGWFirewallPolicy (east-west, inter-VPC)
+
+VPCNetworkSecurityGroup (vpcName)     ──referenced by──▶  VPCGatewayFirewallPolicy (north-south)
+
+NetworkService                        ──referenced by──▶  any rule's services[] (all three firewall kinds)
+
+SecurityProfile  ──bound to a VPC via──▶  SecurityProfileAttachment  ──governs posture of──▶  that VPC
+
+TGWSecurityConfig (GatewayFirewall: true)  ──gates enforcement of──▶  TGWFirewallPolicy
+
+VPCConnectivityProfile  ──bound to a Project via──▶  VPCConnectivityProfileBinding  ──sets IP/NAT/TGW posture of──▶  that Project's VPCs
 ```
 
-`NetworkSecurityGroup` is the only object the other three *require* to express meaningful rules; `SecurityProfile` is orthogonal and VPC-scoped. In practice, a tenant onboarding baseline creates one `SecurityProfile`, a handful of `NetworkSecurityGroup`s (one per application tier or trust zone), a default-deny `FirewallPolicy` and `VPCGatewayFirewallPolicy`, and adds `TGWFirewallPolicy` only if the tenant's architecture spans multiple VPCs.
+A group object is the only thing the three firewall-policy kinds *require* to express meaningful rules; `SecurityProfile` is orthogonal, and inert until attached. In practice, a tenant onboarding baseline creates one `SecurityProfile` plus its `SecurityProfileAttachment`, a handful of `NetworkSecurityGroup`/`VPCNetworkSecurityGroup` objects (one per application tier or trust zone, matching the policy kind that will reference them), a default-deny `FirewallPolicy` and `VPCGatewayFirewallPolicy`, and adds `TGWFirewallPolicy` (plus a `TGWSecurityConfig` enabling it) only if the tenant's architecture spans multiple VPCs. §3.7–§3.12 cover the remaining supporting kinds — reusable service definitions, realized-membership visibility, rule-template bundles, and connectivity/capability posture — and how each fits into an automation pipeline.
+
+### 3.7 `NetworkService` — reusable service/port definitions
+
+A named, reusable match for protocol/port combinations, referenced from any rule's `services[]` via `networkServiceName` instead of inlining an `l4PortSet` every time. `NetworkServiceSpec.serviceEntries[]` accepts exactly one of five shapes per entry: `l4PortSet` (TCP/UDP + ports), `icmp` (`icmpType`/`icmpCode`/`protocol`), `ipProtocol` (`protocolNumber`, for matching raw IP protocols beyond TCP/UDP/ICMP), `alg` (Application Layer Gateway protocols), or `igmp` (no extra properties).
+
+```yaml
+apiVersion: vpc.nsx.vmware.com/v1alpha1
+kind: NetworkService
+metadata:
+  name: platform-https
+  namespace: acme-prod-ns01
+spec:
+  description: "Standard HTTPS"
+  serviceEntries:
+    - l4PortSet:
+        l4Protocol: TCP
+        destinationPorts: ["443"]
+```
+
+```yaml
+      services:
+        - networkServiceName: platform-https
+```
+
+**Automation use:** define a small, platform-owned library of `NetworkService` objects (`platform-https`, `platform-mysql`, `internal-dns`, …) once in a shared Git path, and have every tenant `FirewallPolicy`/`VPCGatewayFirewallPolicy`/`TGWFirewallPolicy` rule reference them by name. A port change becomes a one-line PR against the shared library instead of a grep-and-replace across every tenant's rule set.
+
+### 3.8 `NetworkSecurityGroupIPMembers` / `VPCNetworkSecurityGroupIPMembers` — realized membership (read-only)
+
+Read-only subresources — no `spec`, just a top-level `ipAddresses[]` — that report the IPs a group's selectors *actually* resolved to right now. They exist because `vmSelectors`/`podSelectors` are dynamic: a typo'd `matchLabels` value silently resolves to zero members, leaving a rule that references the group with no effective peers and no error anywhere.
+
+```bash
+kubectl get networksecuritygroupipmembers acme-app-tier -n acme-prod-ns01 -o yaml
+kubectl get vpcnetworksecuritygroupipmembers acme-web-tier-vpc -n acme-prod-ns01 -o yaml
+```
+
+**Automation use:** add a post-apply validation step to the CI/CD pipeline — after applying a `NetworkSecurityGroup`/`VPCNetworkSecurityGroup` change, read the matching `IPMembers` subresource and assert it's non-empty (or matches an expected count) *before* promoting the paired `FirewallPolicy`/`VPCGatewayFirewallPolicy` change that references it. This turns a silent "selector matched nothing" mistake into a failed pipeline step instead of a production outage discovered later.
+
+### 3.9 `SecurityStrategy` — reusable rule-template bundles
+
+`SecurityStrategySpec` holds `description` plus `ruleTemplates[]` — an array in the **same shape** as a `FirewallPolicy` rule (`action`, `appliedTo`, `direction`, `from[]`, `to[]`, `services[]`, `isDefault`, `tag`, …). This looks purpose-built for defining a reusable, named bundle of firewall rules once and applying it consistently.
+
+> **Open question, verify before automating around it:** the reference doesn't document a field on `SecurityProfile`, `FirewallPolicy`, or any other kind that binds a `SecurityStrategy` object by name. `SecurityProfileSpec.eastWestFirewall.securityStrategies[]` (§3.2) instead takes fixed strings (`none`, `vpc-isolation`, `vpc-secure-connection`, `vpc-isolation-with-essential-services`, `vpc-external-connectivity`) that read like built-in system identifiers, not references to user-authored `SecurityStrategy` objects. Before designing a Terraform module around custom `SecurityStrategy` objects, confirm in your own environment (`kubectl get securitystrategy -A`, and whether creating a new one actually changes anything) whether this kind is currently consumer-facing or system-internal.
+
+**Automation use (once confirmed live):** one `SecurityStrategy` per compliance baseline (e.g. `pci-dfw-baseline`), owned and versioned by the security team, referenced by name from every tenant's `SecurityProfile` instead of copy-pasting the same baseline rules into each tenant's `FirewallPolicy`.
+
+### 3.10 `TGWSecurityConfig` — the Transit Gateway firewall on/off switch
+
+A subresource of `TransitGateway`: `spec.features[]` is a list of `{ name, enabled }` pairs, where the only documented `name` value is `GatewayFirewall`. This is the master switch — a `TGWFirewallPolicy` (§3.5) enforces nothing on a given Transit Gateway until that gateway's `TGWSecurityConfig` has `GatewayFirewall: enabled: true`, the same way a `SecurityProfile` is inert until attached via `SecurityProfileAttachment` (§3.2).
+
+```yaml
+apiVersion: vpc.nsx.vmware.com/v1alpha1
+kind: TGWSecurityConfig
+metadata:
+  name: corp-shared-tgw-security-config
+  namespace: acme-prod-ns01
+spec:
+  features:
+    - name: GatewayFirewall
+      enabled: true
+```
+
+**Automation use:** this is a day-0, platform-Terraform-owned object — provisioned once alongside the shared `TransitGateway`/`TGWAttachment`, not per-tenant. Add a pre-merge check to the tenant GitOps pipeline that rejects a `TGWFirewallPolicy` PR if the target gateway's `TGWSecurityConfig.spec.features[name=GatewayFirewall].enabled` isn't already `true` — otherwise the rules merge cleanly and silently do nothing.
+
+### 3.11 `VPCConnectivityProfile` / `VPCConnectivityProfileBinding` — VPC north-south connectivity posture
+
+`VPCConnectivityProfileSpec` governs a VPC's outward connectivity: `externalIPBlockNames[]`, `privateTGWIPBlockNames[]`, `transitGatewayName`, `regionName` (required), `isDefault`, and `serviceGateway` (`enable` + `natConfig.{autoSNATIPBlockName, enableDefaultSNAT}`). `VPCConnectivityProfileBinding` is what makes a profile usable — it binds a named `VPCConnectivityProfile` to a Project/namespace via `spec.vpcConnectivityProfileName` (required), after which that Project's VPCs can use it.
+
+**Correction vs. earlier drafts of this paper:** despite being the object most associated with "VPC connectivity posture," this schema version has **no explicit isolation-mode field** here (no `Community`/`Isolated`/`Promiscuous`-style enum on `VPCConnectivityProfileSpec`). That kind of default-connectivity toggle more likely lives on `FirewallPolicySpec.connectivityPreference`/`applicationConnectivityStrategy` instead (§3.3) — but those enum values aren't documented either, so verify directly rather than assuming either placement.
+
+```yaml
+apiVersion: vpc.nsx.vmware.com/v1alpha1
+kind: VPCConnectivityProfile
+metadata:
+  name: acme-external-connectivity
+  namespace: acme-prod-ns01
+spec:
+  regionName: region-a
+  transitGatewayName: corp-shared-tgw
+  externalIPBlockNames: [corp-external-ipblock]
+  serviceGateway:
+    enable: true
+    natConfig:
+      enableDefaultSNAT: true
+---
+apiVersion: vpc.nsx.vmware.com/v1alpha1
+kind: VPCConnectivityProfileBinding
+metadata:
+  name: acme-connectivity-binding
+  namespace: acme-prod-ns01
+spec:
+  vpcConnectivityProfileName: acme-external-connectivity
+```
+
+**Automation use:** platform-owned, Terraform, day-0. Maintain a small, fixed set of standard connectivity profiles (`internet-facing`, `internal-only`, `shared-services-attached`) centrally, and let each tenant Project simply bind to one via `VPCConnectivityProfileBinding` rather than hand-rolling IP-block/NAT/Transit-Gateway settings per tenant.
+
+### 3.12 `RegionNetworkingCapabilities` — capability discovery for automation gating
+
+Read-only, one object per Region: a top-level `capabilities[]` array of `{ type, state, reason, message }`, e.g. an older region might report `{"type": "IPSecVPN", "state": false, "reason": "UnsupportedByNSXVersion"}`.
+
+**Automation use:** a pre-flight check — in a Terraform data source lookup or a CI/CD pipeline step — before generating manifests that depend on a specific capability (a `TGWFirewallPolicy`, an `IPSecVPN`, etc.) in a given region. Reading `RegionNetworkingCapabilities` first and failing fast with a clear message beats letting the `apply` fail deep inside backend reconciliation because the target region doesn't support the feature yet.
 
 ---
 
@@ -289,8 +451,26 @@ resource "kubernetes_manifest" "security_profile" {
       namespace = var.tenant_namespace
     }
     spec = {
+      regionName         = var.region_name
+      isDefault          = false
       northSouthFirewall = { enabled = true }
-      tcpStrict          = true
+      eastWestFirewall   = { securityStrategies = ["vpc-isolation"] }
+    }
+  }
+}
+
+resource "kubernetes_manifest" "security_profile_attachment" {
+  manifest = {
+    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
+    kind       = "SecurityProfileAttachment"
+    metadata = {
+      name      = "${var.tenant_name}-security-profile-attachment"
+      namespace = var.tenant_namespace
+    }
+    spec = {
+      regionName          = var.region_name
+      securityProfileName = "${var.tenant_name}-security-profile"
+      vpcName             = var.tenant_vpc_name
     }
   }
 }
@@ -304,7 +484,8 @@ resource "kubernetes_manifest" "app_tier_group" {
       namespace = var.tenant_namespace
     }
     spec = {
-      memberSelector = { vmSelector = { matchLabels = { tier = "app" } } }
+      regionName  = var.region_name
+      vmSelectors = [{ labelSelector = { matchLabels = { tier = "app" } } }]
     }
   }
 }
@@ -318,6 +499,9 @@ resource "kubernetes_manifest" "default_deny_gateway" {
       namespace = var.tenant_namespace
     }
     spec = {
+      regionName = var.region_name
+      vpcName    = var.tenant_vpc_name
+      category   = "LocalGatewayRules"
       rules = [
         { name = "deny-all-inbound", direction = "IN", action = "DROP" }
       ]
@@ -462,7 +646,7 @@ spec:
                      └───────────────┬───────────────────┘
                                     ▼
                      ┌───────────────────────────────┐
-                     │   NSX Manager / Policy         │
+                     │   VCF Networking control plane │
                      │   → vDefend enforcement:       │
                      │     Distributed FW (E-W/intra) │
                      │     VPC Gateway FW (N-S)       │
@@ -481,7 +665,7 @@ spec:
 
 **Scenario**: Tenant `acme` needs a `web` / `app` / `db` three-tier application with default-deny micro-segmentation and a locked-down perimeter, permitting only public HTTPS to the web tier, `web → app:8443`, and `app → db:5432`.
 
-**Step 1 (Terraform, onboarding pipeline)** — create the Project, VPC, Subnet, baseline `SecurityProfile`, tier `NetworkSecurityGroup`s, and default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy` (extends §4.3):
+**Step 1 (Terraform, onboarding pipeline)** — create the Project, VPC, Subnet, baseline `SecurityProfile`/`SecurityProfileAttachment`, tier `NetworkSecurityGroup`/`VPCNetworkSecurityGroup` objects, and default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy` (extends §4.3):
 
 ```hcl
 resource "kubernetes_manifest" "default_deny_east_west" {
@@ -493,7 +677,9 @@ resource "kubernetes_manifest" "default_deny_east_west" {
       namespace = "acme-prod-ns01"
     }
     spec = {
-      securityProfile = "${var.tenant_name}-security-profile"
+      regionName = var.region_name
+      category   = "Application"
+      stateful   = true
       rules = [
         { name = "deny-all-in", direction = "IN", action = "DROP" },
         { name = "deny-all-out", direction = "OUT", action = "DROP" }
@@ -514,9 +700,10 @@ metadata:
   name: acme-web-tier
   namespace: acme-prod-ns01
 spec:
-  memberSelector:
-    vmSelector:
-      matchLabels: { tier: web }
+  regionName: region-a
+  vmSelectors:
+    - labelSelector:
+        matchLabels: { tier: web }
 ---
 apiVersion: vpc.nsx.vmware.com/v1alpha1
 kind: NetworkSecurityGroup
@@ -524,9 +711,10 @@ metadata:
   name: acme-app-tier
   namespace: acme-prod-ns01
 spec:
-  memberSelector:
-    vmSelector:
-      matchLabels: { tier: app }
+  regionName: region-a
+  vmSelectors:
+    - labelSelector:
+        matchLabels: { tier: app }
 ---
 apiVersion: vpc.nsx.vmware.com/v1alpha1
 kind: NetworkSecurityGroup
@@ -534,10 +722,24 @@ metadata:
   name: acme-db-tier
   namespace: acme-prod-ns01
 spec:
-  memberSelector:
-    vmSelector:
-      matchLabels: { tier: db }
+  regionName: region-a
+  vmSelectors:
+    - labelSelector:
+        matchLabels: { tier: db }
+---
+apiVersion: vpc.nsx.vmware.com/v1alpha1
+kind: VPCNetworkSecurityGroup
+metadata:
+  name: acme-web-tier-vpc
+  namespace: acme-prod-ns01
+spec:
+  vpcName: acme-prod-vpc01
+  vmSelectors:
+    - labelSelector:
+        matchLabels: { tier: web }
 ```
+
+`acme-web-tier-vpc` is a separate `VPCNetworkSecurityGroup` mirroring `acme-web-tier` — `VPCGatewayFirewallPolicy` rules can't reference the region-scoped `NetworkSecurityGroup` kind (§3.1).
 
 `tenants/acme/security-policy/perimeter.yaml`:
 
@@ -548,14 +750,19 @@ metadata:
   name: acme-perimeter
   namespace: acme-prod-ns01
 spec:
+  regionName: region-a
+  vpcName: acme-prod-vpc01
+  category: LocalGatewayRules
   rules:
     - name: allow-inbound-https
       direction: IN
       action: ALLOW
-      destinationGroups: [acme-web-tier]
+      to:
+        - groupName: acme-web-tier-vpc
       services:
-        - protocol: TCP
-          destinationPorts: ["443"]
+        - l4PortSet:
+            l4Protocol: TCP
+            destinationPorts: ["443"]
     - name: deny-all-other-inbound
       direction: IN
       action: DROP
@@ -570,23 +777,31 @@ metadata:
   name: acme-tier-isolation
   namespace: acme-prod-ns01
 spec:
+  regionName: region-a
+  category: Application
   rules:
     - name: allow-web-to-app
       direction: IN
       action: ALLOW
-      sourceGroups: [acme-web-tier]
-      destinationGroups: [acme-app-tier]
+      from:
+        - groupName: acme-web-tier
+      to:
+        - groupName: acme-app-tier
       services:
-        - protocol: TCP
-          destinationPorts: ["8443"]
+        - l4PortSet:
+            l4Protocol: TCP
+            destinationPorts: ["8443"]
     - name: allow-app-to-db
       direction: IN
       action: ALLOW
-      sourceGroups: [acme-app-tier]
-      destinationGroups: [acme-db-tier]
+      from:
+        - groupName: acme-app-tier
+      to:
+        - groupName: acme-db-tier
       services:
-        - protocol: TCP
-          destinationPorts: ["5432"]
+        - l4PortSet:
+            l4Protocol: TCP
+            destinationPorts: ["5432"]
 ```
 
 **Step 3 (day-2, tenant-driven)** — Acme's app team adds a `cache` tier. Their security engineer opens a PR adding a new `NetworkSecurityGroup` (`acme-cache-tier`) and a rule to `tier-isolation.yaml`:
@@ -595,11 +810,14 @@ spec:
     - name: allow-app-to-cache
       direction: IN
       action: ALLOW
-      sourceGroups: [acme-app-tier]
-      destinationGroups: [acme-cache-tier]
+      from:
+        - groupName: acme-app-tier
+      to:
+        - groupName: acme-cache-tier
       services:
-        - protocol: TCP
-          destinationPorts: ["6379"]
+        - l4PortSet:
+            l4Protocol: TCP
+            destinationPorts: ["6379"]
 ```
 
 Once merged and approved by the `CODEOWNERS`-designated security lead, Argo CD syncs it — no Terraform run, no platform team ticket, and the default-deny `FirewallPolicy` and locked-down `VPCGatewayFirewallPolicy` still govern anything not explicitly matched.
@@ -614,15 +832,16 @@ Once merged and approved by the `CODEOWNERS`-designated security lead, Argo CD s
 - **Least privilege for automation identities.** The Terraform CI runner's CCI token and Argo CD's cluster secret should each be scoped (via `authorization.cci.vmware.com` `RoleBinding`s) to only the tenant namespace(s) they manage — never a Project-wide or Region-wide credential.
 - **Policy review is code review.** Route `FirewallPolicy`/`VPCGatewayFirewallPolicy`/`TGWFirewallPolicy` PRs through the same review gates as application code — `CODEOWNERS`, required approvals from a security lead, and (where available) a policy-linting CI step that rejects rules without an explicit `direction`/`action`/port scope, or that reference a `NetworkSecurityGroup` not defined anywhere in the repo.
 - **Dry-run before merge.** Where supported, validate manifests with `kubectl apply --dry-run=server` or `terraform plan` against a non-production tenant namespace before promoting to production tenants — catches schema drift between API versions early.
-- **Audit trail = Git history.** Because both patterns terminate in Git-reviewed changes, `git log` on the tenant security repo (or Terraform module) becomes your compliance evidence trail for "who approved this firewall change and when" — a materially stronger artifact than NSX Manager UI audit logs alone.
-- **Feed enforcement telemetry back into the loop.** IDS/IPS and Malware Prevention detections (surfaced via NSX Intelligence / vDefend, and attached via `SecurityProfile`) should inform future `FirewallPolicy` tightening — treat detected-but-not-yet-blocked lateral movement attempts as backlog items for the next policy PR.
-- **Watch the TGW blast radius.** `TGWFirewallPolicy` changes can affect traffic between multiple tenants' VPCs if they share a Transit Gateway — route these through the platform team's `AppProject`/module rather than granting individual tenants write access to this kind.
+- **Audit trail = Git history.** Because both patterns terminate in Git-reviewed changes, `git log` on the tenant security repo (or Terraform module) becomes your compliance evidence trail for "who approved this firewall change and when" — a materially stronger artifact than point-and-click console audit logs alone.
+- **Feed enforcement telemetry back into the loop.** vDefend's IDS/IPS and Malware Prevention detections should inform future `FirewallPolicy` tightening — treat detected-but-not-yet-blocked lateral movement attempts as backlog items for the next policy PR.
+- **Watch the TGW blast radius.** `TGWFirewallPolicy` changes can affect traffic between multiple tenants' VPCs if they share a Transit Gateway — route these through the platform team's `AppProject`/module rather than granting individual tenants write access to this kind, and confirm the gateway's `TGWSecurityConfig` (§3.10) already has `GatewayFirewall` enabled before merging.
+- **Validate realized membership before trusting a rule.** A `NetworkSecurityGroup`/`VPCNetworkSecurityGroup` selector that matches nothing fails silently — no error, just a rule with no effective peers. Add a CI step that reads the group's `IPMembers` subresource (§3.8) after apply and fails the pipeline if it's unexpectedly empty, before the paired firewall policy change is allowed to merge.
 
 ---
 
 ## 10. Conclusion
 
-VCF Automation's CCI turns vDefend tenant security from an NSX-Manager, click-driven process into ordinary Kubernetes custom resources under `vpc.nsx.vmware.com/v1alpha1` — `NetworkSecurityGroup` for reusable workload membership, `SecurityProfile` for VPC-wide enforcement posture, and `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` for the three real enforcement points (intra-VPC east-west, per-VPC north-south, and inter-VPC east-west, respectively). That single fact is what unlocks both Terraform and Argo CD as first-class automation paths without any custom tooling. Use Terraform for atomic, reviewed, day-0 tenant and baseline-policy provisioning; use Argo CD for continuous, self-healing, Git-driven day-2 policy management; and draw a hard ownership line between the two so they never fight over the same object. Combined with quota- and RBAC-based guardrails set by the provider team, this gives tenants real self-service over their own micro-segmentation posture — without giving up centralized governance, auditability, or the ability to prove compliance from Git history alone.
+VCF Automation's CCI turns vDefend tenant security from a point-and-click, console-driven process into ordinary Kubernetes custom resources under `vpc.nsx.vmware.com/v1alpha1` — `NetworkSecurityGroup`/`VPCNetworkSecurityGroup` for reusable workload membership, `SecurityProfile`/`SecurityProfileAttachment` for VPC-wide enforcement posture, `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` for the three real enforcement points (intra-VPC east-west, per-VPC north-south, and inter-VPC east-west, respectively), and a set of supporting kinds — `NetworkService`, the `IPMembers` subresources, `SecurityStrategy`, `TGWSecurityConfig`, and `VPCConnectivityProfile`/`VPCConnectivityProfileBinding` — that round out reuse, validation, and connectivity posture around them (§3.7–§3.12). That single fact is what unlocks both Terraform and Argo CD as first-class automation paths without any custom tooling. Use Terraform for atomic, reviewed, day-0 tenant and baseline-policy provisioning; use Argo CD for continuous, self-healing, Git-driven day-2 policy management; and draw a hard ownership line between the two so they never fight over the same object. Combined with quota- and RBAC-based guardrails set by the provider team, this gives tenants real self-service over their own micro-segmentation posture — without giving up centralized governance, auditability, or the ability to prove compliance from Git history alone.
 
 ---
 
