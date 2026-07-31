@@ -10,7 +10,7 @@
 
 VMware Cloud Foundation (VCF) 9's VPC (Virtual Private Cloud) model exposes VCF Networking and **vDefend** security — Distributed Firewall (micro-segmentation), VPC Gateway Firewall, and Transit Gateway Firewall — as declarative Kubernetes-style custom resources through VCF Automation's **Cloud Consumption Interface (CCI)**, under the `vpc.nsx.vmware.com/v1alpha1` API group. This turns tenant security configuration from a series of point-and-click console workflows into version-controlled, reviewable, and automatable code. This paper focuses on the five resource kinds that carry that security model — **`NetworkSecurityGroup`**, **`SecurityProfile`**, **`FirewallPolicy`**, **`VPCGatewayFirewallPolicy`**, and **`TGWFirewallPolicy`** — plus seven closely related supporting kinds surfaced by the verified schema (**`VPCNetworkSecurityGroup`**, **`SecurityProfileAttachment`**, **`NetworkService`**, **`NetworkSecurityGroupIPMembers`**/**`VPCNetworkSecurityGroupIPMembers`**, **`SecurityStrategy`**, **`TGWSecurityConfig`**, **`VPCConnectivityProfile`**/**`VPCConnectivityProfileBinding`**, and **`RegionNetworkingCapabilities`**) — and presents two production-grade automation patterns against them: **Terraform** (apply-time infrastructure-as-code) and **Argo CD** (continuous GitOps reconciliation), including a worked multi-tier tenant onboarding example with runnable code.
 
-> **Accuracy note (verified 2026-07-31):** The resource shapes, field names, and required fields below were checked directly against the Broadcom Developer Portal's raw HTML for the `xapis/cci-api` reference (`vpc.nsx.vmware.com/v1alpha1`) — the earlier draft of this paper reconstructed field names from administration-guide prose and got several of them wrong. Two corrections worth flagging up front: (1) `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` rules use `from`/`to` arrays of single-peer objects (`{ groupName }` or `{ ipAddress }`), not flat `sourceGroups`/`destinationGroups` string lists, and port/protocol matching nests under `services[].l4PortSet`, not flat on the rule; (2) there is no `spec.securityProfile` field on any firewall policy kind — a `SecurityProfile` only takes effect once bound to a VPC through a separate `SecurityProfileAttachment` object. See §3 for the full corrected shapes, and still confirm against your own build with `kubectl explain <kind> --api-version=vpc.nsx.vmware.com/v1alpha1` before committing production manifests, since API versions evolve.
+> **Accuracy note (verified 2026-07-31):** The resource shapes, field names, and required fields below were checked against two sources: the Broadcom Developer Portal's raw HTML for the `xapis/cci-api` reference (`vpc.nsx.vmware.com/v1alpha1`), and `kubectl`/UI output captured from a running VCF 9.1 environment — the earlier draft of this paper reconstructed field names from administration-guide prose alone and got several of them wrong. Corrections worth flagging up front: (1) `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` rules use `from`/`to` arrays of single-peer objects (`{ groupName }` or `{ ipAddress }`), not flat `sourceGroups`/`destinationGroups` string lists, and port/protocol matching nests under `services[].l4PortSet`, not flat on the rule; (2) there is no `spec.securityProfile` field on any firewall policy kind — a `SecurityProfile` only takes effect once bound to a VPC through a separate `SecurityProfileAttachment` object; (3) `direction`/`action`/`ipProtocol` values are PascalCase in practice (`In`/`Out`/`InOut`, `Allow`/`Drop`/`JumpToApplication`, `IPV4`) — the API reference's own prose text disagrees with itself on some of this (e.g. writing `IPV_4`) and working manifests were treated as authoritative where the two conflicted. See §3 for the full corrected shapes, and still confirm against your own build with `kubectl explain <kind> --api-version=vpc.nsx.vmware.com/v1alpha1` before committing production manifests, since API versions evolve.
 
 ---
 
@@ -134,6 +134,22 @@ spec:
           tier: web
 ```
 
+**Free namespace-scoped grouping via auto-tags.** VCF Automation automatically tags every VM's network interface with `kubernetes.io/metadata.name: <namespace name>` and `nsx-op/vm_namespace: <namespace name>` the moment it's deployed into a Supervisor Namespace — no manual labeling required. A `NetworkSecurityGroup` built on that tag captures the whole namespace, present and future, for free:
+
+```yaml
+apiVersion: vpc.nsx.vmware.com/v1alpha1
+kind: NetworkSecurityGroup
+metadata:
+  name: prod01-namespace
+spec:
+  regionName: region-a
+  vmSelectors:
+    - labelSelector:
+        matchLabels:
+          nsx-op/vm_namespace: prod01-8sg7f
+```
+
+This is the cheapest possible day-0 isolation boundary: pair it with a two-rule `FirewallPolicy` (allow intra-namespace, `JumpToApplication`; deny everything else) to get "one namespace = one blast-radius" without hand-maintaining tier labels per VM. Confirmed limitations: this pattern does **not** work for VKS cluster nodes (they're grouped via separate, auto-generated tags instead) or for workloads attached to a *shared* VPC subnet rather than a dedicated one — check both before assuming a namespace-tag group covers 100% of a tenant's workloads.
 ### 3.2 `SecurityProfile` + `SecurityProfileAttachment` — the VPC's security posture
 
 `SecurityProfile` is a standalone, `regionName`-scoped object — it does nothing on its own. A separate **`SecurityProfileAttachment`** object (`regionName` + `securityProfileName` + `vpcName`, all required) is what actually binds it to a VPC. `SecurityProfileSpec` itself controls VPC-wide enforcement behavior rather than individual rules: whether the north-south (gateway) firewall is enabled at all, and which east-west micro-segmentation strategy the VPC runs. There is no `tcpStrict` field here (that lives on each firewall policy kind, §3.3–3.5) and no IDS/IPS or Malware Prevention profile reference field in this API group.
@@ -165,6 +181,47 @@ spec:
   vpcName: acme-prod-vpc01
 ```
 
+**Confirmed from a running VCF 9.1 environment:** rather than hand-authoring `eastWestFirewall.securityStrategies` from scratch, VCF Automation ships one pre-created, system-owned `SecurityProfile` per named strategy — a tenant picks a posture by pointing their `SecurityProfileAttachment.spec.securityProfileName` at one of these, not by writing custom strategy values. `kubectl get securityprofiles` on a real region returns:
+
+```
+NAME                                    SECURITY STRATEGIES                    NORTHSOUTHFIREWALL ENABLED   AGE
+default--m01-reg01                      none                                    false                        40d
+system-security-profile-2--m01-reg01    vpc-isolation                           false                        40d
+system-security-profile-3--m01-reg01    vpc-isolation-with-essential-services   false                        40d
+system-security-profile-4--m01-reg01    vpc-external-connectivity               false                        40d
+system-security-profile-5--m01-reg01    vpc-secure-connection                   false                        40d
+```
+
+and `kubectl get securityprofileattachments` shows which VPC is bound to which profile (a VPC that has never been re-pointed stays on the `default` profile — `vpc-isolation`, `vpc-isolation-with-essential-services`, etc. all start at zero VPCs applied):
+
+```
+NAME                REGION      VPC                       SECURITY PROFILE            AGE
+default-m01-reg01   m01-reg01   default-m01-reg01         default--m01-reg01          40d
+vpc-dev             m01-reg01   vpc-dev                    default--m01-reg01          12d
+vpc-prod            m01-reg01   vpc-prod                   default--m01-reg01          12d
+```
+
+Day-2 changes are ordinary `kubectl patch` calls against these objects — useful as an imperative complement to the Terraform/Argo CD patterns in §4–§5, e.g. for a break-glass change or a quick lab test:
+
+```bash
+# Switch vpc-dev onto the "VPC Isolation" strategy
+kubectl patch SecurityProfileAttachment vpc-dev -p \
+  '{"spec":{"securityProfileName": "system-security-profile-2--m01-reg01"}}'
+
+# Promote a different profile to be the region's default (isDefault: true)
+kubectl patch SecurityProfile system-security-profile-4--m01-reg01 -p \
+  '{"spec":{"isDefault": true}}'
+
+# Turn on the VPC Gateway Firewall for whatever profile a VPC is bound to
+kubectl patch SecurityProfile system-security-profile-4--m01-reg01 -p \
+  '{"spec":{"northSouthFirewall": {"enabled": true}}}'
+```
+
+**Confirmed limitations worth building into any automation around this:**
+- A `FirewallPolicy`/`VPCGatewayFirewallPolicy` generated by a `SecurityProfile` cannot be edited or have rules added to it directly. To customize behavior, author a **separate** policy with a higher-priority (lower `priority` number, or a `category` that evaluates earlier) that runs *before* the Security-Profile-generated one — never attempt to patch the generated policy in place.
+- Essential-services rules generated by a profile (DNS/NTP/DHCP/ICMP) always allow both directions; this is not configurable per profile.
+- Because every `SecurityProfile`-generated rule terminates in `JumpToApplication` rather than an explicit `Allow`, the `vpc-secure-connection` and `vpc-external-connectivity` strategies **fail closed**: if the tenant hasn't authored an explicit `Application`-category `FirewallPolicy` permitting the traffic, it's dropped by the time evaluation reaches the default rule — don't assume "external connectivity enabled" means traffic actually flows without a matching application-category allow rule.
+
 ### 3.3 `FirewallPolicy` — east-west (Distributed Firewall) rules
 
 The general-purpose, intra-VPC micro-segmentation policy. Holds an ordered `rules[]` list; each rule's `from`/`to` are arrays of **single-peer objects** (`{ groupName: <NetworkSecurityGroup name> }` or `{ ipAddress: <CIDR/IP> }`), not flat string lists, and port/protocol matching nests under `services[].l4PortSet` (or a `networkServiceName` reference to a reusable `NetworkService` object) rather than sitting flat on the rule.
@@ -182,8 +239,8 @@ spec:
   tcpStrict: true
   rules:
     - name: allow-web-to-app
-      direction: IN
-      action: ALLOW
+      direction: In
+      action: Allow
       from:
         - groupName: acme-web-tier
       to:
@@ -193,8 +250,8 @@ spec:
             l4Protocol: TCP
             destinationPorts: ["8443"]
     - name: deny-all-app-inbound
-      direction: IN
-      action: DROP
+      direction: In
+      action: Drop
       to:
         - groupName: acme-app-tier
 ```
@@ -208,10 +265,12 @@ Key fields:
 | `spec.stateful` / `spec.tcpStrict` | Per-policy connection tracking and 3-way-handshake enforcement. |
 | `spec.appliedTo.groupNames[]` | Policy-level scoping; takes precedence over any rule-level `appliedTo`. |
 | `spec.connectivityPreference` / `spec.applicationConnectivityStrategy[]` | Present only on `FirewallPolicySpec` (not on `TGWFirewallPolicySpec`/`VPCGatewayFirewallPolicySpec`). Likely where a Community/Isolated/Promiscuous-style default-connectivity posture actually lives — `VPCConnectivityProfile` (§3.11) does **not** expose such a field — but accepted values aren't documented here; confirm with `kubectl explain` before relying on it. |
-| `spec.rules[].direction` / `action` | Free-form strings in the reference (e.g. `IN`/`OUT`, `ALLOW`/`DROP`/`REJECT` by Distributed Firewall convention) — not documented as a strict enum in this API reference, so confirm the exact accepted values with `kubectl explain` against your build. |
-| `spec.rules[].from[]` / `to[]` | Each entry is **one** peer: `{ groupName }` referencing a `NetworkSecurityGroup`, or `{ ipAddress }`. Omit for "Any"; set `sourcesExcluded`/`destinationsExcluded: true` to invert into an exclusion list. |
-| `spec.rules[].services[]` | Each entry is `{ l4PortSet: { l4Protocol, destinationPorts[], sourcePorts[] } }` or `{ networkServiceName }`. Omit for "Any". |
-| Rule order | Rules evaluate top-to-bottom within a `FirewallPolicy`; `spec.priority` resolves conflicts across policies in the same category. |
+| `spec.rules[].direction` | Confirmed values from working manifests: `In`, `Out`, `InOut` — PascalCase, not the `IN`/`OUT` shown in the raw API reference's own prose. |
+| `spec.rules[].action` | Confirmed values from working manifests: `Allow`, `Drop`, and `JumpToApplication` (the terminal action every `SecurityProfile`-generated policy uses — see §3.2 — to hand off to the next, more specific policy in evaluation order). Also PascalCase; `REJECT` is not confirmed anywhere and may not exist in this API version. |
+| `spec.rules[].ipProtocol` | Confirmed value `IPV4` (no underscore) — the API reference's own prose describes it as `IPV_4`, which working manifests contradict. |
+| `spec.rules[].from[]` / `to[]` | Each entry is **one** peer: `{ groupName }` referencing a `NetworkSecurityGroup`, or `{ ipAddress }`. Omit for "Any", **or** set `groupName: Any` explicitly (both forms appear in working manifests); set `sourcesExcluded`/`destinationsExcluded: true` to invert into an exclusion list. |
+| `spec.rules[].services[]` | Each entry is `{ l4PortSet: { l4Protocol, destinationPorts[], sourcePorts[] } }` or `{ networkServiceName }`. Omit for "Any", or set `networkServiceName: Any` explicitly. Provider-managed built-in services are named with a leading colon (`:HTTPS`, `:DNS`, `:DNS-UDP`) — the same `:name` convention used for shared/system-owned `IPBlock`s and `Limit`s elsewhere in this API group. |
+| Rule order | Rules evaluate top-to-bottom within a `FirewallPolicy`; `spec.priority` resolves conflicts across policies in the same category (lower number = evaluated first). |
 
 ### 3.4 `VPCGatewayFirewallPolicy` — north-south perimeter rules
 
@@ -229,8 +288,8 @@ spec:
   category: LocalGatewayRules     # LocalGatewayRules | Default
   rules:
     - name: allow-inbound-https
-      direction: IN
-      action: ALLOW
+      direction: In
+      action: Allow
       to:
         - groupName: acme-web-tier-vpc   # a VPCNetworkSecurityGroup
       services:
@@ -238,8 +297,8 @@ spec:
             l4Protocol: TCP
             destinationPorts: ["443"]
     - name: deny-all-other-inbound
-      direction: IN
-      action: DROP
+      direction: In
+      action: Drop
 ```
 
 ### 3.5 `TGWFirewallPolicy` — inter-VPC rules on a shared Transit Gateway
@@ -257,8 +316,8 @@ spec:
   category: Default                # LocalGatewayRules | Default
   rules:
     - name: allow-shared-services-to-acme
-      direction: IN
-      action: ALLOW
+      direction: In
+      action: Allow
       appliedTo:
         gatewayAttachmentNames: [acme-prod-tgw-attachment]
       from:
@@ -270,8 +329,8 @@ spec:
             l4Protocol: TCP
             destinationPorts: ["443"]
     - name: deny-other-vpcs
-      direction: IN
-      action: DROP
+      direction: In
+      action: Drop
 ```
 
 ### 3.6 How the kinds compose
@@ -333,7 +392,7 @@ kubectl get vpcnetworksecuritygroupipmembers acme-web-tier-vpc -n acme-prod-ns01
 
 `SecurityStrategySpec` holds `description` plus `ruleTemplates[]` — an array in the **same shape** as a `FirewallPolicy` rule (`action`, `appliedTo`, `direction`, `from[]`, `to[]`, `services[]`, `isDefault`, `tag`, …). This looks purpose-built for defining a reusable, named bundle of firewall rules once and applying it consistently.
 
-> **Open question, verify before automating around it:** the reference doesn't document a field on `SecurityProfile`, `FirewallPolicy`, or any other kind that binds a `SecurityStrategy` object by name. `SecurityProfileSpec.eastWestFirewall.securityStrategies[]` (§3.2) instead takes fixed strings (`none`, `vpc-isolation`, `vpc-secure-connection`, `vpc-isolation-with-essential-services`, `vpc-external-connectivity`) that read like built-in system identifiers, not references to user-authored `SecurityStrategy` objects. Before designing a Terraform module around custom `SecurityStrategy` objects, confirm in your own environment (`kubectl get securitystrategy -A`, and whether creating a new one actually changes anything) whether this kind is currently consumer-facing or system-internal.
+> **Open question, verify before automating around it:** the reference doesn't document a field on `SecurityProfile`, `FirewallPolicy`, or any other kind that binds a `SecurityStrategy` object by name. `SecurityProfileSpec.eastWestFirewall.securityStrategies[]` (§3.2) instead takes fixed strings (`none`, `vpc-isolation`, `vpc-secure-connection`, `vpc-isolation-with-essential-services`, `vpc-external-connectivity`) that read like built-in system identifiers, not references to user-authored `SecurityStrategy` objects. A real VCF 9.1 environment strengthens this suspicion: it ships exactly five pre-created, **system-owned** `SecurityProfile` objects (`system-security-profile-2` through `-5`, plus `default`), one per named strategy — a tenant consumes a strategy by pointing `SecurityProfileAttachment` at the matching system profile (§3.2), not by authoring a `SecurityStrategy` object. Before designing a Terraform module around custom `SecurityStrategy` objects, confirm in your own environment (`kubectl get securitystrategy -A`, and whether creating a new one actually changes anything) whether this kind is currently consumer-facing or purely system-internal plumbing behind those five fixed strategies.
 
 **Automation use (once confirmed live):** one `SecurityStrategy` per compliance baseline (e.g. `pci-dfw-baseline`), owned and versioned by the security team, referenced by name from every tenant's `SecurityProfile` instead of copy-pasting the same baseline rules into each tenant's `FirewallPolicy`.
 
@@ -503,7 +562,7 @@ resource "kubernetes_manifest" "default_deny_gateway" {
       vpcName    = var.tenant_vpc_name
       category   = "LocalGatewayRules"
       rules = [
-        { name = "deny-all-inbound", direction = "IN", action = "DROP" }
+        { name = "deny-all-inbound", direction = "In", action = "Drop" }
       ]
     }
   }
@@ -681,8 +740,8 @@ resource "kubernetes_manifest" "default_deny_east_west" {
       category   = "Application"
       stateful   = true
       rules = [
-        { name = "deny-all-in", direction = "IN", action = "DROP" },
-        { name = "deny-all-out", direction = "OUT", action = "DROP" }
+        { name = "deny-all-in", direction = "In", action = "Drop" },
+        { name = "deny-all-out", direction = "Out", action = "Drop" }
       ]
     }
   }
@@ -755,8 +814,8 @@ spec:
   category: LocalGatewayRules
   rules:
     - name: allow-inbound-https
-      direction: IN
-      action: ALLOW
+      direction: In
+      action: Allow
       to:
         - groupName: acme-web-tier-vpc
       services:
@@ -764,8 +823,8 @@ spec:
             l4Protocol: TCP
             destinationPorts: ["443"]
     - name: deny-all-other-inbound
-      direction: IN
-      action: DROP
+      direction: In
+      action: Drop
 ```
 
 `tenants/acme/security-policy/tier-isolation.yaml`:
@@ -781,8 +840,8 @@ spec:
   category: Application
   rules:
     - name: allow-web-to-app
-      direction: IN
-      action: ALLOW
+      direction: In
+      action: Allow
       from:
         - groupName: acme-web-tier
       to:
@@ -792,8 +851,8 @@ spec:
             l4Protocol: TCP
             destinationPorts: ["8443"]
     - name: allow-app-to-db
-      direction: IN
-      action: ALLOW
+      direction: In
+      action: Allow
       from:
         - groupName: acme-app-tier
       to:
@@ -808,8 +867,8 @@ spec:
 
 ```yaml
     - name: allow-app-to-cache
-      direction: IN
-      action: ALLOW
+      direction: In
+      action: Allow
       from:
         - groupName: acme-app-tier
       to:
@@ -836,6 +895,12 @@ Once merged and approved by the `CODEOWNERS`-designated security lead, Argo CD s
 - **Feed enforcement telemetry back into the loop.** vDefend's IDS/IPS and Malware Prevention detections should inform future `FirewallPolicy` tightening — treat detected-but-not-yet-blocked lateral movement attempts as backlog items for the next policy PR.
 - **Watch the TGW blast radius.** `TGWFirewallPolicy` changes can affect traffic between multiple tenants' VPCs if they share a Transit Gateway — route these through the platform team's `AppProject`/module rather than granting individual tenants write access to this kind, and confirm the gateway's `TGWSecurityConfig` (§3.10) already has `GatewayFirewall` enabled before merging.
 - **Validate realized membership before trusting a rule.** A `NetworkSecurityGroup`/`VPCNetworkSecurityGroup` selector that matches nothing fails silently — no error, just a rule with no effective peers. Add a CI step that reads the group's `IPMembers` subresource (§3.8) after apply and fails the pipeline if it's unexpectedly empty, before the paired firewall policy change is allowed to merge.
+- **Never edit a `SecurityProfile`-generated policy in place.** Its rules aren't meant to be patched or appended to; per §3.2, the supported customization path is a *separate*, higher-priority policy that runs before it — build that expectation into `CODEOWNERS`/linting so a reviewer doesn't approve a diff against the generated policy itself.
+
+**Known platform limitations to design around (current as of VCF 9.1), not bugs to work around silently:**
+- `VPCGatewayFirewallPolicy`/`VPCNetworkSecurityGroup` objects are not visible or usable from inside a Project's Supervisor context the way `NetworkSecurityGroup` is — don't assume VPC-scoped groups are reachable from every automation surface a tenant touches.
+- The namespace auto-tag grouping pattern (§3.1) does not work for VKS cluster nodes or for workloads on a *shared* VPC subnet — plan a separate grouping strategy (auto-generated tags, or explicit labels) for those workloads rather than assuming one `NetworkSecurityGroup` pattern covers a whole tenant.
+- Custom `NetworkService` creation has been observed to reject at least some arbitrary TCP ports (e.g. the Kubernetes API's `6443`) in current builds — verify a custom `NetworkService` actually applies before depending on it in a pipeline, rather than assuming any port/protocol combination is definable.
 
 ---
 
