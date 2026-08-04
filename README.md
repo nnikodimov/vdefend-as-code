@@ -41,9 +41,9 @@ The recommended pattern for most enterprises is **hybrid**: Terraform provisions
 
 ---
 
-## 2. Background: VCF Automation, CCI, and the vDefend Security Model
+## 2. How Organizations Consume vDefend: The Multi-Tenant Self-Service Model
 
-This is the section that explains *how* self-service actually happens: the API layer tenants talk to (§2.1), the tenancy boundary that keeps one Organization's security posture invisible and unreachable to every other (§2.2), and the three vDefend enforcement points that boundary protects (§2.3).
+This is the section that matters most: the API layer an Organization talks to (§2.1), the tenancy boundary that keeps one Organization's security posture invisible and unreachable to every other (§2.2), the three vDefend enforcement points that boundary protects (§2.3), and what actually happens end-to-end when an Organization uses it (§2.4). Everything after this section is either the reference for these objects (§3) or a way to drive them at scale (§4 onward) — the self-service model itself lives here.
 
 ### 2.1 Cloud Consumption Interface (CCI)
 
@@ -77,6 +77,14 @@ Provider Admin
 
 An **NSX Project** is the representation of an Organization (tenant) in NSX. Everything a tenant can self-service — including security policy — is scoped inside the namespaces their Project owns, bounded by quotas and RBAC the provider admin defined up front via `infrastructure.cci.vmware.com` and `authorization.cci.vmware.com`. This is the enforcement point that makes tenant self-service safe: tenants can create/update `FirewallPolicy` and related objects freely inside their own namespace, but cannot touch another tenant's VPC or exceed their allotted network/compute quota.
 
+**What actually stops Organization A from touching Organization B's security posture** is three ordinary Kubernetes mechanisms stacked together, not a convention anyone has to remember to follow:
+
+1. **Namespace boundary.** Every `vpc.nsx.vmware.com/v1alpha1` object — `NetworkSecurityGroup`, `FirewallPolicy`, `SecurityProfile`, all of it — lives inside a specific Supervisor Namespace. There is no cluster-scoped variant of these kinds a tenant can reach.
+2. **RBAC (`authorization.cci.vmware.com`).** A tenant's kubeconfig context is bound to role bindings scoped to their own namespace(s) only. The Kubernetes API server itself — not an application-layer check — rejects a request against a namespace the token isn't bound to.
+3. **Quota (`infrastructure.cci.vmware.com`).** Even inside their own namespace, a tenant can't exceed the network/compute limits a provider admin set at Project creation, so one Organization's self-service activity can't starve another's.
+
+Together these are what make "self-service" and "safe" the same sentence: an Organization gets full read/write control over its own vDefend posture, and zero visibility or reach into anyone else's — enforced by the API server, not by policy.
+
 ### 2.3 vDefend security constructs surfaced through the VPC
 
 vDefend is Broadcom's security suite, natively built into VCF. Inside a VPC, its three enforcement points are:
@@ -86,11 +94,24 @@ vDefend is Broadcom's security suite, natively built into VCF. Inside a VPC, its
 - **Transit Gateway Firewall (inter-VPC)** — east-west enforcement *between* VPCs that share a Transit Gateway, driven by `TGWFirewallPolicy`, letting a platform team carve out precise exceptions (e.g., "a shared-services VPC may reach any tenant VPC on port 443 only") on top of the coarser connectivity posture set by `VPCConnectivityProfile` (§3.11). It has its own on/off master switch: a `TGWFirewallPolicy` enforces nothing until the referenced Transit Gateway's `TGWSecurityConfig` enables the `GatewayFirewall` feature (§3.10).
 - **`SecurityProfile`** is not itself an enforcement point but the cross-cutting object that controls *how* the above behave for a given VPC — specifically, whether the VPC's north-south (gateway) firewall is enabled at all (`northSouthFirewall.enabled`) and which east-west micro-segmentation strategy applies (`eastWestFirewall.securityStrategies`, e.g. `vpc-isolation`). It only takes effect once bound to a VPC via a separate `SecurityProfileAttachment` object — see §3.2. TCP-strict handshake enforcement (`tcpStrict`) is actually a per-policy field on each `FirewallPolicy`/`VPCGatewayFirewallPolicy`/`TGWFirewallPolicy`, not on `SecurityProfile`.
 
+### 2.4 Self-service in practice
+
+Concretely, here's what "self-service" means for a newly onboarded Organization — no ticket, no provider-side engineer, at any step after the Project exists:
+
+1. **Authenticate.** The tenant admin logs into VCF Automation (or a pipeline calls `vcfa_kubeconfig`/an equivalent token exchange) and receives a kubeconfig context scoped to their own Supervisor Namespace — nothing else is visible.
+2. **Talk to the API directly.** With that kubeconfig, `kubectl get networksecuritygroups,firewallpolicies -n <their-namespace>` works immediately — it's a real Kubernetes API server, not a ticketing front-end to one.
+3. **Change posture themselves.** `kubectl apply -f web-tier-nsg.yaml` (or a Terraform `apply`, or a merged GitOps PR — §4/§5 show both) creates a `NetworkSecurityGroup`, and a follow-up `FirewallPolicy` referencing it, entirely inside their own namespace.
+4. **See enforcement immediately.** VCF Networking reconciles the object and starts enforcing the rule at the Distributed Firewall — no provider-side apply step, no shared change window.
+
+That loop — authenticate, read, write, see it enforced — is the whole self-service story. Section 3 is the full reference for the objects used in step 3; §4 onward show how to run that loop at fleet scale instead of by hand.
+
 Automating "tenant vDefend security" in practice means automating these five resource kinds — declaratively, reviewably, in Git. Everything that follows in §3 is the reference for exactly how to do that; §4–§8 show it running end to end.
 
 ---
 
 ## 3. The vDefend Security Resources in `vpc.nsx.vmware.com/v1alpha1`
+
+This is the API surface each Organization gets self-service control over the moment its Project exists — every kind below lives inside a tenant's own Supervisor Namespace (§2.2) and needs nothing from a provider admin to create, update, or delete once the guardrails in §2 are in place.
 
 ### 3.1 `NetworkSecurityGroup` / `VPCNetworkSecurityGroup` — the reusable "who"
 
@@ -443,6 +464,8 @@ Read-only, one object per Region: a top-level `capabilities[]` array of `{ type,
 
 ## 4. Automation Pattern A — Terraform
 
+The self-service loop in §2.4 works by hand for one Organization; the next two sections show two ways to drive that same per-Organization surface at fleet scale instead.
+
 ### 4.1 Why Terraform here
 
 Terraform fits naturally where tenant security config is provisioned **as part of** environment stand-up — e.g., a "new tenant" pipeline that creates the Project, VPC, Subnets, quotas, and the baseline `SecurityProfile`/`NetworkSecurityGroup`/default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy` set in one atomic `apply`, with the safety of `plan` review and state-tracked drift detection. For platform teams that already run multi-cloud IaC on Terraform, this means zero new tooling to onboard a tenant securely on day one.
@@ -566,6 +589,8 @@ resource "kubernetes_manifest" "default_deny_gateway" {
 
 ## 5. Automation Pattern B — Argo CD (GitOps)
 
+Where §4 drives the per-Organization self-service surface from a pipeline, this pattern drives it continuously from Git — the other half of "at scale."
+
 ### 5.1 Why GitOps here
 
 Security policy is not "set once at provisioning" — it changes continuously as tenant applications evolve (new microservice, new port, decommissioned tier). Treating it as a one-time Terraform apply leaves a gap for exactly the kind of manual, undocumented change that turns into an audit finding. Argo CD's continuous reconciliation loop closes that gap:
@@ -665,6 +690,8 @@ The two tools aren't competing for the same job — they excel at opposite ends 
 
 ## 7. Reference Architecture
 
+Both automation paths above — and the direct `kubectl` path from §2.4 that neither pipeline replaces — converge on the same per-Organization CCI surface:
+
 ```
 ┌─────────────────────────────┐        ┌──────────────────────────────┐
 │  Platform Team Git Repo      │        │  Tenant Security Git Repo     │
@@ -710,6 +737,8 @@ The two tools aren't competing for the same job — they excel at opposite ends 
 ---
 
 ## 8. Worked Example: Onboarding a 3-Tier Tenant Application
+
+This is the self-service model from §2.4 run for one real Organization, start to finish — provider-side Terraform for the shell, then the tenant's own team driving every security change afterward.
 
 **Scenario**: Tenant `acme` needs a `web` / `app` / `db` three-tier application with default-deny micro-segmentation and a locked-down perimeter, permitting only public HTTPS to the web tier, `web → app:8443`, and `app → db:5432`.
 
@@ -876,7 +905,7 @@ Once merged and approved by the `CODEOWNERS`-designated security lead, Argo CD s
 
 ## 9. Governance, Guardrails, and Operational Guidance
 
-Self-service and control aren't in tension here — they're sequential. Guardrails go in first; self-service runs safely inside them. The practices below are what make that hold up in production, not just in the demo.
+Self-service and control aren't in tension here — they're sequential. The isolation guarantees in §2.2 (namespace boundary, RBAC, quota) are what make handing an Organization full control over its own vDefend posture safe in the first place; guardrails go in first, self-service runs safely inside them. The practices below are what make that hold up in production, not just in the demo.
 
 - **Guardrails precede self-service.** Provider admins set `infrastructure.cci.vmware.com` quotas (network CIDR ranges, VPC/subnet counts) and `authorization.cci.vmware.com` RBAC *before* handing a tenant Project autonomy over `NetworkSecurityGroup`/`FirewallPolicy` objects — this is what makes "tenant self-service security" safe rather than reckless.
 - **Least privilege for automation identities.** The Terraform CI runner's CCI token and Argo CD's cluster secret should each be scoped (via `authorization.cci.vmware.com` `RoleBinding`s) to only the tenant namespace(s) they manage — never a Project-wide or Region-wide credential.
@@ -897,11 +926,11 @@ Self-service and control aren't in tension here — they're sequential. Guardrai
 
 ## 10. Conclusion
 
-The headline is simple: VCF Automation's CCI turns vDefend tenant security from a point-and-click, console-driven process into ordinary Kubernetes custom resources under `vpc.nsx.vmware.com/v1alpha1` — `NetworkSecurityGroup`/`VPCNetworkSecurityGroup` for reusable workload membership, `SecurityProfile`/`SecurityProfileAttachment` for VPC-wide enforcement posture, `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` for the three real enforcement points (intra-VPC east-west, per-VPC north-south, and inter-VPC east-west, respectively), and a set of supporting kinds — `NetworkService`, the `IPMembers` subresources, `SecurityStrategy`, `TGWSecurityConfig`, and `VPCConnectivityProfile`/`VPCConnectivityProfileBinding` — that round out reuse, validation, and connectivity posture around them (§3.7–§3.12).
+The headline is the delivery model, not the tooling: VCF Automation's CCI gives every Organization its own self-service vDefend surface — `NetworkSecurityGroup`/`VPCNetworkSecurityGroup` for reusable workload membership, `SecurityProfile`/`SecurityProfileAttachment` for VPC-wide enforcement posture, `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` for the three real enforcement points (intra-VPC east-west, per-VPC north-south, and inter-VPC east-west, respectively), plus a set of supporting kinds (§3.7–§3.12) — scoped, isolated, and safe per tenant by construction (§2.2), reachable directly by `kubectl` from the moment a Project exists (§2.4). No point-and-click console step, no ticket to a central security team, no purpose-built security-automation product to wait for.
 
-That single fact is what unlocks both Terraform and Argo CD as first-class automation paths without any custom tooling, connector, or vendor SDK. Use Terraform for atomic, reviewed, day-0 tenant and baseline-policy provisioning; use Argo CD for continuous, self-healing, Git-driven day-2 policy management; and draw a hard ownership line between the two so they never fight over the same object. Combined with quota- and RBAC-based guardrails set by the provider team, this gives tenants real self-service over their own micro-segmentation posture — without giving up centralized governance, auditability, or the ability to prove compliance from Git history alone.
+Terraform and Argo CD (§4–§8) are how a platform team runs that same self-service surface at fleet scale rather than one Organization at a time: Terraform for atomic, reviewed, day-0 tenant and baseline-policy provisioning; Argo CD for continuous, self-healing, Git-driven day-2 policy management; a hard ownership line between the two so they never fight over the same object. Neither adds a new capability — they operationalize the multi-tenant self-service model that CCI already delivers out of the box.
 
-The practical takeaway for a platform team evaluating this today: you don't need to wait for a purpose-built security-automation product. The primitives are already Kubernetes-native, already work with the IaC and GitOps tooling you've standardized on, and are ready to onboard your next tenant securely — starting with the worked example in §8.
+The practical takeaway for a platform team evaluating this today: the primitives are already Kubernetes-native, already give every Organization real self-service over its own micro-segmentation posture without giving up centralized governance or auditability, and already work with the IaC and GitOps tooling you've standardized on. Start with the self-service loop in §2.4, then the worked example in §8 to see it run end to end for a real tenant.
 
 ---
 
