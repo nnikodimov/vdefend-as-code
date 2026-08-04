@@ -4,6 +4,8 @@
 
 ## Abstract
 
+---
+
 VMware Cloud Foundation (VCF) 9's VPC (Virtual Private Cloud) model exposes Networking and Security, — as declarative Kubernetes-style custom resources through VCF Automation's **Cloud Consumption Interface (CCI)**. This turns Organizations (tenants) security configuration from a series of point-and-click console workflows into version-controlled, reviewable, and automatable code. This paper focuses on the API resource kinds that carry that security model and explores two production-grade automation patterns against them: **Terraform** (apply-time infrastructure-as-code) and **Argo CD** (continuous GitOps reconciliation), including a worked multi-tier tenant onboarding example with runnable code.
 ---
 
