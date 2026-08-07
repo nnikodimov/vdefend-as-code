@@ -9,7 +9,7 @@ Private cloud is being re-platformed around a simple expectation: application te
 
 This paper is written for cloud and platform architects who already know their way around VCFA and vDefend and want a concrete design pattern for wiring the two together to embed zero-trust security directly into self-service cloud templates, Kubernetes manifests, and Infrastructure-as-Code pipelines. It is a blueprint for:
 
-- **Declarative Security APIs:** Exposing vDefend security features available for VCFA tenants through the Cloud Consumption Interface (CCI) and standard Kubernetes Custom Resource Definitions (CRDs).
+- **Declarative APIs:** Exposing vDefend security features available for VCFA tenants through the Cloud Consumption Interface (CCI) and standard Kubernetes Custom Resource Definitions (CRDs).
 - **Layered Multi-Tenancy:** Layering VCFA constructs, like namespaces and applications with Virtual Private Cloud (VPC) and vDefend security posture, so that Providers can properly plan and impose the required infrastructure guardrails, while preserving the tenants' flexibility to define their individual applications' protection without interfering with the infra-wide security baseline.
 - **Day-0 Security Baseline:** Enforcing security policies at resource creation time so that workloads are protected immediately upon deployment.
 - **Automated Lifecycle Operations:** Delivering end-to-end policy management using Terraform for Day-0 and Day-1 deployment, and Argo CD for Day-2 continuous GitOps reconciliation.
@@ -48,66 +48,154 @@ This paper assumes the reader is already familiar with VCFA and its multi-tenanc
 
 ---
 
-## 3. Modern Infrastrcuture Hierarchy
+## 3. Anatomy of a Multi-Tenant VCF Private Cloud
 
-### 3.1 Main VCFA Constructs Mapping
+Before any security design can be expressed as code, it needs a precise map of what is being secured. This section establishes that map in three steps: the VCFA constructs a tenant actually consumes and what each one becomes in vSphere and NSX (§3.1), the vDefend security constructs layered on top of them (§3.2), and the RBAC model that decides who may change which of those constructs (§3.3).
 
-VCFA maps tenant management abstractions directly into native vSphere and NSX constructs to deliver isolated, multi-tenant cloud environments. The vSphere Supervisor acts as the primary control plane and translation engine in VCFA, converting raw ESXi, vSAN, and NSX infrastructure into a declarative, Kubernetes-native cloud fabric.
+### 3.1 From VCFA Abstractions to vSphere and NSX
 
-An **NSX Project** is the representation of an Organization (tenant) in NSX. Creating a VCFA Organization automatically provisions a corresponding NSX Project in the underlying fabric. Everything a tenant can self-service — including security policy — is scoped inside the Project they own, bounded by quotas and RBAC that a provider admin sets.
+VCFA maps tenant management abstractions directly into native vSphere and NSX constructs to deliver isolated, multi-tenant cloud environments. The vSphere Supervisor acts as the primary control plane and translation engine, converting raw ESXi, vSAN, and NSX infrastructure into a declarative, Kubernetes-native cloud fabric. A tenant never provisions an NSX segment or a vSphere resource pool by hand — they declare an intent against VCFA, and the Supervisor renders it into the fabric objects underneath.
 
-The **Virtual Private Cloud (VPC)** inside the NSX Project is what turns a shared physical private cloud into a set of self-contained environments scoped to a tenant. A Project can own more than one VPC.
-
-The vSphere Namespace is a Kubernetes resource boundary running on a Supervisor. When a tenant provisions a vSphere Namespace with VPC networking enabled, the Supervisor maps that namespace directly to a VPC inside the tenant's NSX Project.
-
-### 3.2 Security Model
-
-In VCFA 9.1, VMware vDefend exposes declarative security constructs through the consumption API, allowing tenants to self-manage zero-trust microsegmentation within provider-defined boundaries. These constructs map directly to NSX VPCs and vSphere Namespaces, abstracting low-level network policies into standardized, self-service objects.
 ```
-Provider Admin
- └─ Region (group of Supervisors)
-      └─ Project  (tenant boundary)
-           ├─ VPC                       (vpc.nsx.vmware.com/v1alpha1)
-           │    ├─ Subnet(s)
-           │    ├─ SecurityProfile            <-- posture toggles (N-S FW on/off, TCP-strict)
-           │    ├─ NetworkSecurityGroup(s)     <-- reusable "who" (web-tier, app-tier, db-tier...)
-           │    ├─ FirewallPolicy(ies)         <-- east-west DFW rules (intra-VPC)
-           │    ├─ VPCGatewayFirewallPolicy    <-- north-south perimeter rules (per-VPC)
-           │    └─ TGWFirewallPolicy           <-- east-west rules between VPCs on a shared TGW
-           └─ Supervisor Namespace(s)          <-- one or more attach to the VPC above: dedicated (1:1) or shared (N:1)
-                └─ Workloads: VirtualMachines, VKS clusters, vSphere Pods
+Organization                    the tenant — an identity, governance and quota domain
+ │
+ ├─ Region                      one or more Supervisors and the vSphere/NSX fabric behind them
+ │
+ └─ Project                     the consumption boundary a tenant's users work inside
+      │
+      ├─ VPC                    the tenant's own routed network domain
+      │    └─ Subnet(s)         the address space workloads actually land on
+      │
+      └─ Supervisor Namespace(s)   bound to exactly one VPC: dedicated (1:1) or shared (N:1)
+           ├─ VirtualMachines   VM Service VMs
+           ├─ VKS cluster(s)    conformant Kubernetes; nodes are VMs on the same VPC subnets
+           │    └─ Pods         scheduled by the cluster itself, behind its own CNI
+           └─ vSphere Pods      containers running natively on ESXi
 ```
 
-**What actually stops Organization A from touching Organization B's security posture** is three ordinary Kubernetes mechanisms stacked together, not a convention anyone has to remember to follow:
+**Organization.** The Organization is the tenant. It is the outermost administrative and identity boundary: users, groups, identity-provider federation, and the total resource allocation a provider is willing to give that tenant all hang off it. On the fabric side, creating a VCFA Organization automatically provisions a corresponding **NSX Project** — the network domain that keeps one tenant's addressing, routing, and policy from colliding with another's. Unlike the constructs below it, the Organization is not itself something a tenant creates or manipulates through the consumption API; it is the container everything else is created *inside*.
 
-1. **Project boundary.** Every object, like `NetworkSecurityGroup`, `FirewallPolicy`, `SecurityProfile`, is created inside the tenant's own namespace, representing the whole Organization/Project. A `FirewallPolicy` or `NetworkSecurityGroup` targets a specific vSphere Namespace's workloads through a label selector (`nsx-op/vm_namespace`, §4.2) or a `vpcName`/`regionName` field in its spec — not by being created inside that namespace. The enforced boundary sits at the Organization's own namespaces.
-2. **RBAC.** A tenant's kubeconfig context is bound to role bindings scoped to their own namespace(s) only. The Kubernetes API server itself — not an application-layer check — rejects a request against a namespace the token isn't bound to.
-3. **Quota.** Even inside their own namespace, a tenant can't exceed the network/compute limits a provider admin set at Project creation.
+**Region.** A Region groups one or more vSphere Supervisors — and the vSphere clusters, storage, and NSX fabric behind them — into a single placement target. It is the answer to "where does this run," and it matters to security design because most vDefend constructs are region-scoped: a security group or a security posture is meaningful within the fabric of one Region, and a tenant spanning two Regions maintains a security definition in each.
 
-Together these are what make "self-service" and "safe" the same sentence, enforced by the API server, not by policy.
+**Project.** The Project is where a tenant's users actually work. It carries the quota (CPU, memory, storage, network objects) and the entitlements — which Regions, which namespace classes, which VM and storage classes — that a provider admin grants. Everything a tenant can self-service, including security policy, is scoped inside the Project they own and bounded by those quotas. An Organization may hold several Projects; a common split is one per environment or per business unit.
 
-Isolating tenants from each other is only half the model. Inside that boundary, VCFA splits control into two tiers so a platform-wide baseline can't be quietly overridden by a single tenant, while tenants still get real, immediate control of their own micro-segmentation:
+**Virtual Private Cloud (VPC).** The VPC is what turns a shared physical private cloud into a set of self-contained environments. Realized as an NSX VPC inside the tenant's NSX Project, it owns its own private address space, its own subnets, its own gateway, and optionally its own NAT and load-balancer endpoints — plus an optional attachment to a shared Transit Gateway when the tenant needs routed connectivity to other VPCs. A Project can own more than one VPC. For security purposes the VPC is the key boundary: it is the object a security posture attaches to, and the edge where north-south traffic is evaluated.
 
-- **Provider/Security Admin level.** Global rules that apply to every tenant, regardless of what any individual app team wants, are defined from the NSX Default Project and delivered through `SecurityProfile`. Rather than tenants hand-authoring an east-west strategy from scratch, VCFA ships pre-created, **system-owned** `SecurityProfile` objects, one per named strategy; a tenant admin *selects* a posture by pointing their `SecurityProfileAttachment` at one of these. A `FirewallPolicy` that a `SecurityProfile` generates cannot be edited or have rules appended to it directly — the only supported customization path is a **separate**, higher-priority policy that runs *before* it (§5.6 covers this delegation boundary in full; §5.1's confirmed limitations shows it in practice).
-- **Tenant level.** Everything below that global baseline is delegated. Inside their own isolated boundary, an app owner creates their own `NetworkSecurityGroup`/`FirewallPolicy` objects to micro-segment their application tiers exactly how they want, with no platform-team involvement per change.
+**Supervisor (vSphere) Namespace.** The Supervisor Namespace is a Kubernetes resource boundary running on a Supervisor, and it is where workloads are actually deployed. In vSphere it is realized as a resource pool and folder with a namespace class attached — the CPU/memory/storage limits, VM classes, storage classes, and content libraries available inside it. In NSX it is realized as network attachment to a VPC subnet, with every workload's network interface automatically tagged with its owning namespace. Each namespace is bound to exactly one VPC at creation time, but that binding is a per-namespace choice: a **dedicated** VPC serves a single namespace (1:1) for strict isolation, while a **shared** VPC hosts several namespaces (N:1) that pool address space and gateway configuration. §5.2 covers when to choose which.
 
-**Evaluation order backs the tiering, not just convention.** Every `FirewallPolicy` carries a `category`, and the confirmed schema values — `Infrastructure`, `Environment`, `Application` — evaluate in that fixed order: fabric-level rules in `Infrastructure`, macro-segmentation (e.g., blocking `Prod` from ever reaching `Dev`) in `Environment`, and tenant micro-segmentation in `Application`. Because categories evaluate top-down, a global rule authored by the Security Admin is always checked before any `Application`-category rule a tenant writes. This split maps directly onto the ownership model §7.5 formalizes: Terraform and the platform team own `Infrastructure`/`Environment`-category baselines and system `SecurityProfile` bindings; Argo CD, watching a tenant's own Git path, owns the `Application`-category policy that tenant iterates on.
+**Workloads.** VirtualMachines provisioned through VM Service, VKS clusters, and vSphere Pods all land inside a Supervisor Namespace and attach to a subnet of that namespace's VPC. For VMs and vSphere Pods, the network interface is automatically tagged with the owning namespace — which is what makes namespace-scoped security groups work with no manual labeling at all (§5.2).
 
-### 3.3 RBAC and Separation of Duties
+**VKS clusters.** vSphere Kubernetes Service is how a tenant self-services a conformant Kubernetes cluster without leaving the platform. The cluster is declared inside a Supervisor Namespace like any other object, and the Supervisor provisions its control-plane and worker nodes as VMs — drawing on that namespace's VM classes and storage classes, and attaching to the same VPC subnets as every other workload there. Two consequences matter for security design:
 
-The tiering in §3.2 is enforced, not just documented, through `authorization.cci.vmware.com` RBAC scoped to three distinct roles:
+- **A VKS cluster is a nested tenancy layer.** The vDefend constructs in this paper enforce at the node VMs' network interfaces. Traffic *between pods inside the cluster* is governed by the cluster's own Kubernetes network policy and CNI, not by the constructs described here — so a complete design for a tenant running VKS has two policy surfaces to keep consistent, not one.
+- **VKS nodes are not covered by the namespace-tag pattern.** Node VMs are grouped through separate, auto-generated tags rather than the namespace tag every other workload carries. The namespace-selector approach in §5.2 therefore does not reach them; plan a distinct grouping strategy wherever VKS is in scope.
 
-- **Cloud Admin.** Owns `infrastructure.cci.vmware.com` (quotas, namespace classes, zone/region association) and `topology.cci.vmware.com` — the guardrails that exist *before* any tenant gets self-service access at all.
-- **Security Admin.** Owns the platform-wide security guardrails from §3.2 — the system `SecurityProfile` catalog, `TGWSecurityConfig`, `VPCConnectivityProfile` — plus review authority over anything that can affect more than one tenant, like `TGWFirewallPolicy` changes on a shared Transit Gateway.
-- **Tenant App Developer.** Scoped, via `authorization.cci.vmware.com` role bindings, to exactly their own Project's namespace(s) — full read/write on `NetworkSecurityGroup` and `FirewallPolicy` inside that boundary, and nothing outside it.
+Summarized:
 
-The same least-privilege principle extends to automation identities, not just people, and it carries directly into §6 and §7: a Terraform CI runner's CCI token and the Argo CD cluster secret should each be scoped to only the tenant namespace(s) they manage — never a Project-wide or Region-wide credential, even though the pipeline itself may be platform-owned.
+| VCFA construct | What the tenant consumes | How it is realized underneath | Who creates it |
+|---|---|---|---|
+| **Organization** | The tenant boundary; identity and total allocation | An NSX Project, plus a VCFA identity and quota domain | Provider admin |
+| **Region** | A place to deploy | One or more vSphere Supervisors and their vSphere/NSX fabric | Provider admin |
+| **Project** | Quota, entitlements, and the working scope for a tenant's users | Quota and entitlement scope enforced by the Supervisor | Provider admin, consumed by the tenant |
+| **VPC** | A private, routed network with its own address space | An NSX VPC: subnets, gateway, NAT/load-balancer endpoints, optional Transit Gateway attachment | Tenant, within quota |
+| **Supervisor Namespace** | A workload and resource boundary | A vSphere resource pool and folder with a namespace class; attached to a VPC subnet, auto-tagged in NSX | Tenant |
+| **Workloads** | VMs and vSphere Pods | vSphere VMs and ESXi-native pods on VPC subnet segments, auto-tagged with their namespace | Tenant / application owner |
+| **VKS cluster** | A conformant Kubernetes cluster, self-serviced | Control-plane and worker node VMs on the namespace's VPC subnets, using its VM and storage classes; grouped by their own auto-generated tags | Tenant / application owner |
+
+### 3.2 The vDefend Security Constructs Exposed to Tenants
+
+Where §3.1 described the infrastructure a tenant consumes, this section describes the security capabilities layered onto it. vDefend exposes its enforcement engines to VCFA tenants as declarative constructs, so that zero-trust micro-segmentation becomes something a tenant self-manages inside provider-defined boundaries rather than something a network security team hand-configures per request. The concern here is what each construct *is* and what it governs; how each one is addressed as an API object is §4's subject.
+
+**Three enforcement points, one per boundary.** Every rule lands at one of three places in the data path, and each maps onto a construct from §3.1 — which is why the infrastructure hierarchy has to be clear before the security model makes sense:
+
+```
+Transit Gateway                    Transit Gateway Firewall
+ │                                   VPC ⇄ VPC, across a shared gateway
+ │
+ └─ VPC                            VPC Gateway Firewall
+      │                              north ⇄ south, at the VPC edge
+      │
+      └─ Supervisor Namespace      Distributed Firewall
+           │                         workload ⇄ workload, at each virtual NIC
+           ├─ VM
+           ├─ VM
+           └─ VM
+```
+
+**Distributed Firewall (DFW).** The DFW is the innermost and most granular layer. It runs in the hypervisor, at every workload's virtual NIC, which means it inspects traffic between two VMs on the same host and the same subnet — traffic that never touches a physical network device and that a traditional perimeter firewall would never see. This is where micro-segmentation actually happens: tier-to-tier rules inside an application, namespace-to-namespace isolation, and default-deny baselines. Because enforcement is attached to the workload rather than to a network location, a VM carries its policy with it when it migrates, and a newly created VM is covered the moment it powers on if it matches an existing group.
+
+**VPC Gateway Firewall.** At the VPC's own edge, the Gateway Firewall governs north-south traffic — what may enter the VPC from outside, and what workloads inside it may reach beyond it. Where the DFW answers "which of my workloads may talk to each other," the VPC Gateway Firewall answers "what may cross this tenant's perimeter at all." It is the natural home for a tenant's ingress exceptions and controlled egress, and it can also be switched on or off wholesale as part of a Security Profile rather than rule by rule.
+
+**Transit Gateway Firewall.** When a tenant's architecture spans several VPCs attached to a shared Transit Gateway, the Transit Gateway Firewall controls traffic *between* those VPCs — a boundary neither the DFW (intra-VPC) nor the VPC Gateway Firewall (perimeter) is positioned to police. It gives finer control than a blanket connectivity posture, letting a design permit exactly one VPC-to-VPC path (a shared-services VPC reachable on one port, say) while denying the rest. It has a master switch: no Transit Gateway rule enforces anything until the Gateway Firewall feature is explicitly enabled on that gateway. Because the Transit Gateway is shared infrastructure serving multiple tenants, both that switch and review authority over its rules stay platform-owned (§5.5).
+
+**Security Profiles.** A Security Profile packages the two boundary firewalls above into a single named *strategy* for a VPC: whether the north-south Gateway Firewall is on, and which east-west strategy applies. Rather than have tenants author a strategy from scratch, VCFA ships a small, fixed catalog of pre-created, **system-owned** profiles, ranging from no restriction through full VPC isolation. A profile does nothing until it is attached to a specific VPC. This is the highest-leverage construct in the whole model, because it reduces a tenant's entire VPC posture to one small object that can be reviewed in a pull request and audited from Git history — with no free-text rule authoring exposed to the tenant at all. §5.1 walks the full strategy catalog.
+
+**Groups — the reusable "who".** Rules never name workloads directly; they name groups. Groups are intent-based rather than address-based: a group is defined by label selectors, namespace membership, VM property matches, static IPs or CIDRs, or nested references to other groups — and the platform re-evaluates membership continuously as workloads come and go. A group meaning "every VM labeled `tier: app`" never needs editing when a VM is added, removed, or re-IP'd. Groups come in two scopes: a Region-scoped group, referenced by Distributed Firewall and Transit Gateway rules, and a VPC-scoped group, referenced by VPC Gateway rules. Because VCFA auto-tags every VM and vSphere Pod with its owning namespace (§3.1), per-namespace grouping requires no labeling work at all.
+
+**Labels — how membership is decided, and who may decide it.** A label applied to a workload in VCFA is translated into an **NSX tag** on that workload, and it is the tag that a group's selector ultimately matches. Labels are therefore not cosmetic metadata: they are part of the security boundary, because whoever can set a label can change which rules a workload falls under.
+
+VCFA handles that by giving certain labels their own RBAC. **Privileged labels** — also called **protected labels** — are a distinct class whose application, modification, and removal are permission-controlled rather than freely settable by whoever owns the workload:
+
+- **Ordinary labels** can be set by whoever owns the workload. An application owner tags their own VMs `tier: web` or `app: payments`, a group selects on it, and nobody else needs to be involved.
+- **Privileged (protected) labels** are defined and assigned at the Organization tier — by the **Organization Admin** or **Organization Security Admin**, not by the application owner whose workload carries the label. That is what makes them useful as a boundary: an application team cannot mark its own workload as in-scope for a compliance policy, nor strip a marker that puts it under one.
+
+Both kinds become NSX tags and are selected on identically; the difference is purely who is authorized to set them. This is the significance of the `protected/` label prefix in §5.3 and §5.4's examples — those groups are keyed to labels an application owner cannot reassign at will. Note that the boundary here is *within* a tenant, not between tenant and provider: protected labels are the tenant's own admins' instrument for governing their application teams, which is what makes a tenant-authored security baseline hold up against the teams operating inside it. Without that split, anyone able to label a VM could label their way into or out of any group, and the tiering described below would be advisory rather than enforced.
+
+**Services — the reusable "what".** Where groups are the "who," services are the "what": named protocol and port definitions (TCP/UDP port sets, ICMP, raw IP protocols, ALG protocols) that any rule can reference by name. Defining "the application's ingress ports" once and referencing it from several policies keeps port literals out of individual rules, so a change to an application's port set is a single edit rather than a sweep across every policy that mentioned it.
+
+Summarized:
+
+| Security construct | What it governs | Where it enforces | Typically owned by |
+|---|---|---|---|
+| **Distributed Firewall** | East-west traffic between workloads | In the hypervisor, at each workload's virtual NIC | Shared: platform baselines, tenant micro-segmentation |
+| **VPC Gateway Firewall** | North-south traffic in and out of a VPC | At the VPC edge | Tenant, within the attached Security Profile |
+| **Transit Gateway Firewall** | Traffic between VPCs on a shared gateway | At the shared Transit Gateway | Platform / Security Admin |
+| **Security Profile** | A VPC's whole posture, as one named strategy | Generates policy at the VPC edge and east-west | Catalog: platform. Selection: tenant |
+| **Group** | Which workloads a rule applies to | n/a — referenced by rules | Platform for shared groups, tenant for app groups |
+| **Label** | Which workloads fall into a group; translated to an NSX tag | n/a — an attribute of the workload | Ordinary: workload owner. Privileged/protected: Organization Admin or Organization Security Admin |
+| **Service** | Which protocols and ports a rule matches | n/a — referenced by rules | Platform for common services, tenant for app-specific |
+
+**Categories set evaluation order, so the tiering is enforced rather than conventional.** Every firewall policy carries a category — Infrastructure, Environment, or Application — and those categories evaluate top-down in that fixed order: fabric-level rules in Infrastructure, macro-segmentation (blocking Prod from ever reaching Dev, say) in Environment, and tenant micro-segmentation in Application. A global rule authored by a Security Admin is therefore always checked before any Application-category rule a tenant writes. This ordering is what makes the two-tier model below structural rather than a matter of trust.
+
+**Two tiers of ownership.** Isolating tenants from each other is only half the model. Inside a tenant's boundary, VCFA splits control so a platform-wide baseline cannot be quietly overridden, while tenants still get immediate control of their own micro-segmentation:
+
+- **Provider / Security Admin tier.** Rules that must apply to every tenant regardless of what any individual tenant wants are defined centrally and delivered through the system-owned Security Profile catalog and Infrastructure/Environment-category policies. A policy that a Security Profile generates cannot be edited, nor can rules be appended to it — the only supported customization path is a **separate**, higher-priority policy evaluated *before* it. That constraint is deliberate: it keeps the system-owned baseline tamper-evident. §5.6 covers this delegation boundary in full; §5.1 shows it in practice.
+- **Tenant tier.** Everything below that baseline is delegated to the Organization. Its own admins select the VPC's Security Profile, define the protected labels their application teams must live with, and set any Organization-wide policy; below them, application owners label their workloads with ordinary labels and create their own groups and Application-category policies to segment their application tiers, with no involvement from anyone per change.
+
+The tenant tier is therefore not flat. A tenant Organization runs the same guardrail pattern internally that the provider runs above it — protected labels and Organization-wide policy in place of the system profile catalog — which is what lets a large tenant delegate to its own application teams without giving up a baseline.
+
+This split maps directly onto the tooling ownership model §7.5 formalizes: Terraform and the platform team own the Infrastructure/Environment-category baselines and the system profile bindings; Argo CD, watching a tenant's own Git path, owns the Application-category policy that tenant iterates on.
+
+### 3.3 Who Can Change What: The RBAC Model
+
+The two-tier model in §3.2 only holds if it is enforced by the platform rather than observed by convention. In VCFA it is enforced by the CCI API server itself, through ordinary Kubernetes authorization primitives — which means a tenant cannot exceed their boundary even with a hand-crafted API call, a rogue script, or a misconfigured pipeline.
+
+**Three mechanisms stacked together** are what stop Organization A from touching Organization B's security posture:
+
+1. **Project boundary.** Every security object a tenant creates lands in the namespace representing their own Organization/Project. Because policies and groups reference their targets by name and label rather than by placement, the tenancy boundary is a namespace boundary — and namespaces are the unit Kubernetes authorization already understands.
+2. **RBAC.** A tenant's kubeconfig context is bound to role bindings scoped to their own namespace(s) only. The API server — not an application-layer check that could be bypassed — rejects any request against a namespace the token is not bound to.
+3. **Quota.** Even inside their own namespace, a tenant cannot exceed the network and compute limits a provider admin set at Project creation. Self-service has a ceiling, and that ceiling is set outside the tenant's reach.
+
+Together these make "self-service" and "safe" the same sentence, enforced by the API server rather than by policy documents.
+
+**Roles and what each one owns.** VCFA's role bindings partition the constructs from §3.1 and §3.2 across two provider-side and two tenant-side personas — the split matters, because the tenant side has its own internal guardrail tier, not just a single "tenant" identity:
+
+| Role | Owns | Cannot |
+|---|---|---|
+| **Cloud Admin** (provider) | Organizations, Regions, Projects, quotas, namespace classes, zone and region association — the guardrails that exist *before* any tenant gets self-service access | — |
+| **Provider Security Admin** | The system Security Profile catalog and org-wide default strategy; Transit Gateway security config and connectivity profiles; `Infrastructure`/`Environment`-category baselines; review authority over anything affecting more than one tenant | Typically holds no workload-provisioning rights — separation of duties runs both ways |
+| **Organization Admin / Organization Security Admin** (tenant) | Their Organization's Projects, VPCs, and Supervisor Namespaces; selecting and switching a VPC's Security Profile; toggling the Gateway Firewall; **defining and assigning protected labels**, and the Organization-wide policy keyed to them | Cannot invent a VPC-level strategy outside the provider's catalog, or edit a profile-generated policy |
+| **Application Owner / Developer** (tenant) | Workloads and their *ordinary* labels; `Application`-category groups and policies inside their own namespace | Cannot set or remove a protected label, bypass namespace isolation, or override the VPC-level posture above them |
+
+Each persona receives a kubeconfig context scoped to exactly the namespaces their bindings allow, so the same credential that lets a developer deploy a VM is the credential that constrains which security objects they can see at all. Nothing outside their scope is visible, let alone writable — which is what makes it safe to hand tenants a raw Kubernetes API endpoint in the first place (§4.1).
+
+**The same principle applies to automation identities, not just people**, and it carries directly into §6 and §7: a Terraform CI runner's CCI token and the Argo CD cluster credential should each be scoped to only the tenant namespace(s) they manage — never a Project-wide or Region-wide credential, even when the pipeline itself is platform-owned. A pipeline with broader rights than the humans it serves quietly undoes the whole model.
 
 ---
 
-## 4. The vDefend API Surface, Consumed via VCFA (CCI)
+## 4. Consuming vDefend Through the CCI API
 
-*(condensed — this is reference material to make §5–§8 legible, not the paper's main subject; the full field-by-field spec is in Appendix A)*
+§3.2 described *what* the vDefend security constructs are. This section covers *how* they are addressed: the API surface a tenant, a Terraform run, or a GitOps controller actually talks to. It is deliberately short — reference material to make §5–§8 legible, not the paper's main subject. The field-by-field spec is in Appendix A.
 
 ### 4.1 CCI as a Standard Kubernetes API Server
 
@@ -115,11 +203,9 @@ VCFA's **Cloud Consumption Interface (CCI)** is a real Kubernetes API server, no
 
 In CCI, the Organization acts as the parent container for VCFA Projects: authentication tokens (whether from a `kubectl` login flow or a Terraform run) evaluate against a user or pipeline's assigned Organization and Project membership. The Organization itself is an administrative and identity domain managed at the VCFA governance tier, so — unlike the Project (`project.cci.vmware.com`, §4.2) — it is not instantiated as its own Kubernetes Custom Resource Definition (CRD).
 
-### 4.2 The Object Model at a Glance
+### 4.2 The API Groups
 
-vDefend's `NetworkSecurityGroup` objects are built on VM attributes — labels, tags, namespace membership — rather than static IP addresses, so a group like "every VM labeled `tier: app`" never needs editing as VMs are added, removed, or re-IP'd; the Distributed Firewall re-evaluates membership continuously. VCFA goes a step further and auto-tags every VM's network interface the moment it lands in a Supervisor Namespace (`nsx-op/vm_namespace: <namespace name>`), so "one namespace = one blast-radius" is a day-0 isolation boundary with zero manual tagging — a pattern §5.2 builds on directly.
-
-The relevant API groups, and the kinds each exposes:
+CCI presents the constructs from §3 across a handful of API groups, split by who owns them:
 
 | API group | Purpose |
 |---|---|
@@ -129,18 +215,39 @@ The relevant API groups, and the kinds each exposes:
 | `vpc.nsx.vmware.com/v1alpha1` | **VPC networking and security**: `VPC`, `Subnet`, `NetworkSecurityGroup`/`VPCNetworkSecurityGroup`, `NetworkService`, `SecurityProfile`/`SecurityProfileAttachment`, `FirewallPolicy`, `VPCGatewayFirewallPolicy`, `TGWFirewallPolicy`/`TGWSecurityConfig`, `VPCConnectivityProfile`/`Binding` |
 | `vmoperator.vmware.com/v1alpha3` | VM lifecycle — the workloads the security policy protects |
 
-Everything this paper automates lives in `vpc.nsx.vmware.com/v1alpha1`. In brief:
+Everything this paper automates lives in `vpc.nsx.vmware.com/v1alpha1`. The practical consequence is that a tenant needs no vDefend-specific client: the same `kubectl apply`, the same Terraform `kubernetes_manifest`, and the same GitOps controller that handle a Deployment handle a `FirewallPolicy`.
 
-| Kind | Role |
-|---|---|
-| `NetworkSecurityGroup` / `VPCNetworkSecurityGroup` | The reusable "who" — region-scoped or VPC-scoped membership, by label selector, IP, or nested group |
-| `SecurityProfile` + `SecurityProfileAttachment` | The VPC's security posture (north-south firewall on/off, east-west strategy); inert until attached to a VPC |
-| `FirewallPolicy` | East-west (Distributed Firewall) rules, intra-VPC |
-| `VPCGatewayFirewallPolicy` | North-south perimeter rules, per-VPC |
-| `TGWFirewallPolicy` + `TGWSecurityConfig` | East-west rules between VPCs on a shared Transit Gateway; inert until the gateway's `TGWSecurityConfig` enables `GatewayFirewall` |
-| `NetworkService` | Reusable protocol/port definitions, referenced by name from any rule |
+### 4.3 Security Capabilities and the Kinds That Express Them
 
-### 4.3 How the Kinds Compose
+Each capability from §3.2 is addressed through one or two custom resource kinds:
+
+| Capability (§3.2) | Kind(s) | Notes |
+|---|---|---|
+| Distributed Firewall | `FirewallPolicy` | East-west rules; `spec.category` sets evaluation order |
+| VPC Gateway Firewall | `VPCGatewayFirewallPolicy` | North-south, per-VPC; requires both a Region and a VPC reference |
+| Transit Gateway Firewall | `TGWFirewallPolicy` + `TGWSecurityConfig` | Inert until `TGWSecurityConfig` enables `GatewayFirewall` on the gateway |
+| Security Profile | `SecurityProfile` + `SecurityProfileAttachment` | The profile is inert; the attachment binds it to a VPC |
+| Group | `NetworkSecurityGroup` (Region-scoped) / `VPCNetworkSecurityGroup` (VPC-scoped) | Gateway rules reference the VPC-scoped kind; DFW and TGW rules the Region-scoped one |
+| Service | `NetworkService` | Referenced by name from any rule's service list |
+| Label | *(no kind of its own)* | An attribute on the workload object; groups select on it |
+| VPC connectivity posture | `VPCConnectivityProfile` + `Binding` | Governs what is *routable* before any rule governs what is permitted |
+
+**Where these objects live.** This is the detail most often assumed wrongly. Security objects are *not* nested inside the VPC or the Supervisor Namespace they protect. They are created in the tenant's own namespace representing the whole Organization/Project, and they point at their target by name or label selector:
+
+```
+Project  (the tenant's own namespace — where every object below is created)
+ │
+ ├─ SecurityProfile + SecurityProfileAttachment    ── attaches a posture to ──>  a VPC
+ ├─ NetworkSecurityGroup / VPCNetworkSecurityGroup ── selects ──>  workloads, by label / IP / nesting
+ ├─ NetworkService                                 ── referenced by ──>  any rule's service list
+ ├─ FirewallPolicy                                 ── enforced at ──>  the Distributed Firewall
+ ├─ VPCGatewayFirewallPolicy                       ── enforced at ──>  the VPC gateway
+ └─ TGWFirewallPolicy (+ TGWSecurityConfig)        ── enforced at ──>  the shared Transit Gateway
+```
+
+A `FirewallPolicy` targets a particular namespace's workloads through a label selector or a VPC/Region reference in its spec — not by being created inside that namespace. The enforced tenancy boundary therefore sits at the Organization's own namespace, which is exactly what §3.3 secures.
+
+### 4.4 How the Kinds Compose
 
 ```
 NetworkSecurityGroup (regionName)     --referenced by--> FirewallPolicy (east-west, intra-VPC)
@@ -157,7 +264,7 @@ TGWSecurityConfig (GatewayFirewall: true)  --gates enforcement of--> TGWFirewall
 
 A group object is the only thing the three firewall-policy kinds *require* to express meaningful rules; `SecurityProfile` is orthogonal, and inert until attached. This composition is exactly what §6.3's Terraform baseline and §7.3's Argo CD `ApplicationSet` provision and reconcile, respectively.
 
-### 4.4 A Note on Source Grounding
+### 4.5 A Note on Source Grounding
 
 The schema in this paper is confirmed against a running VCF 9.1 environment (live `kubectl get` output, reproduced in §5) rather than assumed from documentation alone. The authoritative, current reference is Broadcom's published CCI API documentation at `developer.broadcom.com/xapis/cci-api` (linked in Appendix C) — check it directly before an automation module hard-codes an assumption this paper doesn't cover.
 
@@ -285,11 +392,13 @@ Because this isolation policy lives in the `Environment` category, not `Applicat
 
 ### 5.3 Application Segmentation & Ringfencing
 
-The final, finest-grained tier is the application itself. Where namespace isolation answers "can namespace A talk to namespace B," application ringfencing answers "which of the workloads inside my own namespace can talk to each other." The pattern mirrors namespace segmentation but uses a tenant-defined label instead of the auto-assigned namespace tag — this is the piece an application team genuinely self-serves.
+The final, finest-grained tier is the application itself. Where namespace isolation answers "can namespace A talk to namespace B," application ringfencing answers "which of the workloads inside my own namespace can talk to each other." The pattern mirrors namespace segmentation but groups on an explicit label instead of the auto-assigned namespace tag.
 
-This is the layer where "self-service security" is most literal: an application owner labels their own VMs and, through a thin abstraction (a catalog item, a Terraform module, or a GitOps overlay — §6 and §7), gets an app-scoped `NetworkSecurityGroup` and `FirewallPolicy` without ever touching NSX Manager or filing a firewall-change ticket.
+This is the layer where "self-service security" is most literal: labelling a VM is all it takes to place it inside a ringfence, and through a thin abstraction (a catalog item, a Terraform module, or a GitOps overlay — §6 and §7) the app-scoped `NetworkSecurityGroup` and `FirewallPolicy` follow — with nobody touching NSX Manager or filing a firewall-change ticket.
 
-Where an application maps one-to-one onto a namespace, application segmentation is namespace segmentation (§5.2) by another name. Where it doesn't — an app spanning multiple namespaces, or a namespace hosting multiple apps that shouldn't reach each other — **app ringfencing** groups by a custom label instead of the namespace tag:
+Whether that label is an ordinary one or a **protected** one (§3.2) is the design decision worth making deliberately. An ordinary label lets the application team place and move their own workloads freely — maximum autonomy, but a team can also label its way out of its own ringfence. A protected label, assigned by the Organization Admin or Organization Security Admin, makes the ringfence something the application team operates *inside* rather than *controls*. The examples below use the protected form, which is the right default whenever the ringfence exists to satisfy an obligation the tenant's own security owner is accountable for.
+
+Where an application maps one-to-one onto a namespace, application segmentation is namespace segmentation (§5.2) by another name. Where it doesn't — an app spanning multiple namespaces, or a namespace hosting multiple apps that shouldn't reach each other — **app ringfencing** groups by that label instead of the namespace tag:
 
 ```bash
 kubectl label virtualmachines prod01-vm01 protected/app01=backend
@@ -414,7 +523,7 @@ spec:
       action: Drop
 ```
 
-Tenant-specific `TGWFirewallPolicy` rules carve out exactly which cross-VPC paths a multi-VPC tenant needs. Because a misconfigured rule here can affect traffic between *multiple* tenants' VPCs at once, review authority for these rules stays with the Security Admin (§3.3) rather than the tenant alone.
+Tenant-specific `TGWFirewallPolicy` rules carve out exactly which cross-VPC paths a multi-VPC tenant needs. Because a misconfigured rule here can affect traffic between *multiple* tenants' VPCs at once, review authority for these rules stays with the Provider Security Admin (§3.3) rather than the tenant alone.
 
 ### 5.6 Delegation Model and Guardrails-as-Code
 
@@ -643,7 +752,7 @@ spec:
           - CreateNamespace=false   # namespace lifecycle stays with Terraform, not GitOps
 ```
 
-`tenants/acme/security-policy/` in Git contains plain `NetworkSecurityGroup` / `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` YAML — the shapes from §4.2 and the worked example in §8 — reviewed via standard pull request workflow, ideally with a `CODEOWNERS` entry requiring the tenant's security lead to approve changes to their own policy.
+`tenants/acme/security-policy/` in Git contains plain `NetworkSecurityGroup` / `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` YAML — the shapes from §3.2 and the worked example in §8 — reviewed via standard pull request workflow, ideally with a `CODEOWNERS` entry requiring the tenant's security lead to approve changes to their own policy.
 
 ### 7.4 Ordering and Safety
 
@@ -679,7 +788,7 @@ Day-0 Provisioned Security (§5.4) is fully owned by Terraform at onboarding —
 
 ---
 
-## 8. The User Journey: A Worked End-to-End Example
+## 8. A Worked End-to-End Example
 
 **Scenario**: Tenant `acme` needs a `web` / `app` / `db` three-tier application with default-deny micro-segmentation and a locked-down perimeter, permitting only public HTTPS to the web tier, `web → app:8443`, and `app → db:5432`.
 
@@ -761,7 +870,7 @@ spec:
         matchLabels: { tier: web }
 ```
 
-`acme-web-tier-vpc` mirrors `acme-web-tier` as a separate `VPCNetworkSecurityGroup` — `VPCGatewayFirewallPolicy` rules can't reference the region-scoped `NetworkSecurityGroup` kind (§4.2).
+`acme-web-tier-vpc` mirrors `acme-web-tier` as a separate `VPCNetworkSecurityGroup` — `VPCGatewayFirewallPolicy` rules can't reference the region-scoped `NetworkSecurityGroup` kind (§3.2).
 
 `tenants/acme/security-policy/perimeter.yaml`:
 
@@ -843,7 +952,7 @@ Multi-tenant security in VCF 9.1 works when it is designed as a set of composabl
 
 ## Appendix A. VCFA/CCI API Reference
 
-The authoritative, current source for this API is Broadcom's CCI API documentation: [developer.broadcom.com/xapis/cci-api](https://developer.broadcom.com/xapis/cci-api/latest/api-docs.html#k8s-api-vpc-nsx-vmware-com-v1alpha1) — verify field-level details there before an automation module hard-codes an assumption this reference doesn't cover. What follows is the field-by-field detail behind the condensed table in §4.2, confirmed against a running VCF 9.1 environment.
+The authoritative, current source for this API is Broadcom's CCI API documentation: [developer.broadcom.com/xapis/cci-api](https://developer.broadcom.com/xapis/cci-api/latest/api-docs.html#k8s-api-vpc-nsx-vmware-com-v1alpha1) — verify field-level details there before an automation module hard-codes an assumption this reference doesn't cover. What follows is the field-by-field detail behind the constructs introduced in §3.2, confirmed against a running VCF 9.1 environment.
 
 ### A.1 `NetworkSecurityGroup` / `VPCNetworkSecurityGroup` — the reusable "who"
 
@@ -921,6 +1030,7 @@ Read-only, one object per Region: `capabilities[]` array of `{ type, state, reas
 | **Supervisor Namespace** | A VPC-backed namespace; the unit a tenant Project owns and self-services within |
 | **DFW** | Distributed Firewall — east-west, intra-VPC enforcement at the vNIC |
 | **TGW** | Transit Gateway — the shared routing construct connecting multiple VPCs |
+| **Privileged (protected) label** | A VCFA label whose application and removal are RBAC-controlled, translated to an NSX tag; lets a platform team key policy to a marker a tenant cannot reassign |
 | **Micro-segmentation** | Fine-grained, per-workload network isolation, independent of subnet/VLAN |
 | **GitOps** | Operating infrastructure by reconciling live state against a Git repository |
 | **Argo CD** | The GitOps controller this paper uses for day-2 policy reconciliation |
