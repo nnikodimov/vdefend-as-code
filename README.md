@@ -1,4 +1,4 @@
-# Architecting Multi-Tenant Security in VCF with vDefend
+# Architecting Multi-Tenant Security with VCF Automation & vDefend
 ### API-Driven Self-Service Protection for Organizations and Applications
 
 ---
@@ -9,10 +9,10 @@ Private cloud is being re-platformed around a simple expectation: application te
 
 This paper is written for cloud and platform architects who already know their way around VCFA and vDefend and want a concrete design pattern for wiring the two together to embed zero-trust security directly into self-service cloud templates, Kubernetes manifests, and Infrastructure-as-Code pipelines. It is a blueprint for:
 
-- Exposing vDefend security capabilities to VCFA tenants as a self-service, which can be consumed declaratively through APIs.
-- Layering VCFA constructs, like namespaces and applications with Virtual Private Cloud (VPC) and vDefend security posture, so that Providers can properly plan and impose the required infrastructure guardrails, while preserving the tenants' flexibility to define their individual applications' protection without interfering with the infra-wide security baseline.
-- Building this out day-0, so security posture exists before a workload lands, not as an afterthought.
-- Exploring how all of the above can be delivered at scale via Terraform (Day-0/Day-1) and GitOps via Argo CD (Day-2, continuous state reconciliation), eliminating point-and-click console operations.
+- **Declarative Security APIs:** Exposing vDefend security features available for VCFA tenants through the Cloud Consumption Interface (CCI) and standard Kubernetes Custom Resource Definitions (CRDs).
+- **Layered Multi-Tenancy:** Layering VCFA constructs, like namespaces and applications with Virtual Private Cloud (VPC) and vDefend security posture, so that Providers can properly plan and impose the required infrastructure guardrails, while preserving the tenants' flexibility to define their individual applications' protection without interfering with the infra-wide security baseline.
+- **Day-0 Security Baseline:** Enforcing security policies at resource creation time so that workloads are protected immediately upon deployment.
+- **Automated Lifecycle Operations:** Delivering end-to-end policy management using Terraform for Day-0 and Day-1 deployment, and Argo CD for Day-2 continuous GitOps reconciliation.
 
 The result is a model where security is not a gate that slows down self-service infrastructure — it is one of the things being self-served, inside guardrails the platform team controls centrally and exposes through the same API surface as compute, network, and storage.
 
@@ -25,20 +25,22 @@ Security is usually where that pressure breaks something. If every new tenant, V
 
 ### 2.1 Problem statement
 
-In a multi-tenant VCF environment, "security as a manual, centralized process" fails on three axes:
+To build a scalable multi-tenant VCF environment, platform and security teams must address four critical operational areas:
 
-- **Speed** — Compute, storage, and network are self-service; security stays centralized and manual, which makes it the bottleneck by default, not by intent.
-- **Self-Service** - In traditional virtual environments, network security is the last mile of every deployment and the slowest one. An application team finishes provisioning compute and storage in minutes, then opens a ticket asking a security admin to create firewall groups and rules by hand. Conventional firewall rule authoring does not scale with the rate of infrastructure creation that self-service platforms are designed to enable.
-- **Consistency** — Hand-authored firewall rules drift in quality and coverage across tenants, widening the actual security posture gap.
-- **Ownership** — Tenants have no way to reason about or adjust their own security posture, so every legitimate change (a new inbound port) re-enters the same manual queue.
+- **Deployment Velocity:** While compute, storage, and networking are provisioned automatically, security policy creation often remains manual, making security the primary operational delay.
+- **Scalability:** Manual firewall rule authoring does not scale with the rate of infrastructure creation that self-service platforms are designed to enable.
+- **Consistency:** Hand-authored firewall rules vary in structure and quality across tenants, creating configuration drift and potential security gaps.
+- **Tenant Autonomy:** Application teams lack direct visibility into their security posture, requiring support tickets for routine changes such as opening an application port.
 
-### 2.2 Business Goals
+### 2.2 Design Goals
 
-- **Out-of-the-box protection** — a workload should be born into a defined security posture, reducing the risk and blast radius, not provisioned open and protected later.
-- **Self-service within guardrails** — tenants choose and adjust posture from a small, vetted catalog; they do not hand-author firewall rules from scratch.
-- **API-first consumption** — every capability above is available as a declarative resource under the VCFA Consumption API, so it is equally reachable from the UI, `kubectl`, Terraform, or a GitOps controller.
-- **Faster time-to-market** — the security step of a deployment collapses from a ticket-queue wait measured in days or weeks to a pull-request merge measured in minutes.
-- **Simplified, continuous compliance** — because policy changes are reviewed and versioned as a matter of course, compliance evidence for frameworks like PCI-DSS and SOC 2 becomes a byproduct of the normal workflow, not a separate audit-prep exercise.
+The purpose of this document is to address the challenges mentioned above by focusing on the following design objectives.
+
+- **Baseline Protection:** To eliminate post-deployment security gaps and reduce potential blast radius, workloads should be provisioned with a defined security posture, not provisioned open and protected later.
+- **Guardrailed Self-Service:** Tenants select and adjust security settings from pre-vetted platform profiles rather than authoring low-level firewall rules from scratch.
+- **API-First Consumption:** Deliver security posture via constructs exposed as declarative resources through the Cloud Consumption Interface (CCI), making them accessible using standard tools like kubectl, Terraform, or GitOps controllers.
+- **Delivery Speed:** Transition Security updates from manual ticket queues to automated Git pull request workflows, reducing policy approval timelines from days to minutes.
+- **Compliance by Design:** Security policy changes are version-controlled, automatically generating auditable records for regulatory frameworks such as PCI-DSS and SOC 2.
 
 ### 2.3 Scope and assumed reader knowledge
 
@@ -46,9 +48,9 @@ This paper assumes the reader is already familiar with VCFA and its multi-tenanc
 
 ---
 
-## 3. VCF Private Cloud Infrastructure Hierarchy
+## 3. Modern Infrastrcuture Hierarchy
 
-### 3.1 VCFA Constructs Mapping
+### 3.1 Main VCFA Constructs Mapping
 
 VCFA maps tenant management abstractions directly into native vSphere and NSX constructs to deliver isolated, multi-tenant cloud environments. The vSphere Supervisor acts as the primary control plane and translation engine in VCFA, converting raw ESXi, vSAN, and NSX infrastructure into a declarative, Kubernetes-native cloud fabric.
 
@@ -425,19 +427,6 @@ Pulling 5.1–5.5 together, the delegation boundary looks like this:
 | **Application owner** | Label workloads; request an app-scoped `NetworkSecurityGroup`/`FirewallPolicy` via catalog item or Terraform module | Cannot bypass namespace isolation or the VPC-level profile |
 
 The concrete escape hatch worth calling out explicitly: **a policy created by a Security Profile cannot be edited directly.** Its rules are fixed by the profile definition. Customizing behavior means authoring a *separate*, higher-priority `FirewallPolicy` that is evaluated before the profile-owned one. This is a deliberate guardrail: it keeps the system-owned baseline tamper-evident (nobody can silently punch a hole in the profile itself) while still giving tenants and application teams a supported way to add precision on top of it.
-
-### 5.7 Known Platform Limitations and Considerations
-
-Carried through rather than glossed over, because a platform team building automation around these objects needs to design around them, not discover them in production:
-
-- Protected labels and namespace-tag grouping (§5.2, §5.4) do not work for VKS cluster nodes or for workloads attached to a *shared* VPC subnet — plan a separate grouping strategy (auto-generated tags, or explicit labels) for those workloads.
-- Auto-created groups are required for load-balancer VIPs and SNAT — they can't be hand-substituted with a custom group.
-- Custom `NetworkService` definitions have been observed to reject at least some arbitrary TCP ports (e.g. the Kubernetes API's `6443`) — verify a custom `NetworkService` actually applies before depending on it in a pipeline.
-- A Project's Supervisor context cannot see or reuse VPC-scoped groups (`VPCNetworkSecurityGroup`) the way it can region-scoped `NetworkSecurityGroup` objects — don't assume every automation surface a tenant touches can reach both kinds equally.
-- Essential-services rules generated by a `SecurityProfile` (DNS/NTP/DHCP/ICMP) always allow both directions and can't be narrowed per profile; and a profile's east-west/north-south behavior can't be customized beyond selecting one of the five named strategies.
-- VPC Security Profiles do not affect NSX Project default DFW rules (an NSX-level, not VCF-Automation-level, construct) — if an environment falls back to default DFW behavior, the Security Profile catalog is not the layer that changed it.
-
-Practically: the ringfencing and Day-0 patterns in §5.3–5.4 are mature for VM-based workloads today; for VKS/Supervisor workloads, plan on NSX-native grouping and policy authoring as the interim path until CCI-native support catches up, and revisit this section against the current release notes before finalizing a design.
 
 ---
 
