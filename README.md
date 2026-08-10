@@ -155,15 +155,22 @@ The schema in this paper is confirmed against a running VCF 9.1 environment (liv
 
 ---
 
-## 5. Security Use Cases and Design Patterns
+## 5. Use Cases and Design Patterns
 
 Each subsection below walks through one concrete use case for consuming vDefend security through the VCFA Consumption API: what a tenant needs, the design pattern that solves it, and the API objects that implement it — confirmed against a live VCF 9.1 environment. §6 and §7 then show how Terraform and Argo CD actually deliver each pattern; this section stays at the level of the API itself.
 
 ### 5.1 VPC Segmentation
 
-The foundation of the vDefend self-service model is a small, fixed catalog of **system-defined Security Profiles**, each representing a named security *strategy* for a VPC's north-south and VPC-to-VPC traffic. A Tenant Admin does not write DFW rules — they select a strategy, and the platform materializes the underlying policy.
+In VMware Cloud Foundation (VCF), a VPC is a self-service, logically isolated networking domain provisioned within a shared private cloud architecture. Its security posture, however, is an independent concern that has to be addressed. VCFA delivers the declarative self-service consumption layer through the Cloud Consumption Interface (CCI), while vDefend operates as the underlying enforcement engine that materializes Distributed Firewall (DFW) lateral security and VPC Gateway North-South perimeter protection.
 
-The five strategies, from most to least restrictive:
+**Declarative Security Profile Abstractions**
+
+To bridge tenant self-service with a foundational workload protection, vDefend delivers the Security Strategies abstraction. These strategies are exposed via two declarative custom resources within the `vpc.nsx.vmware.com/v1alpha1` API group:
+
+- **`SecurityProfile`**: A system-curated resource that specifies a standardized vDefend security strategy.
+- **`SecurityProfileAttachment`**: A tenant-facing resource that binds a chosen `SecurityProfile` directly to a specific VPC.
+
+The `SecurityProfile` resource offers five standardized strategies, each defining a distinct posture for VPC Inbound and Outbound traffic as well as cross-VPC communication. Rather than authoring low-level firewall rules manually, Tenant Admins select a strategy, allowing vDefend to materialize the corresponding security baseline:
 
 | Strategy | VPC outbound | VPC inbound | VPC-to-VPC | Notes |
 |---|---|---|---|---|
@@ -173,9 +180,9 @@ The five strategies, from most to least restrictive:
 | **VPC External Connectivity** | Allowed | Blocked, except Essential Services | Blocked | A VPC that needs to originate connections out but stay closed to inbound |
 | **VPC Secure Connection** | Allowed | Blocked, except Essential Services | **Allowed** | Adds controlled VPC-to-VPC (e.g., shared-services) connectivity on top of External Connectivity |
 
-Every strategy ends its rule table the same way: traffic that isn't explicitly permitted at the VPC boundary is either dropped, or handed off with a **Jump to Application** action — meaning the VPC-level profile defers the final decision to whatever `FirewallPolicy` exists at the Application category. This two-tier model — a coarse, tenant-selected VPC posture, plus a fine-grained, workload-scoped application policy — is what lets a single Security Profile catalog serve very different applications safely.
+Every strategy follows the same basic pattern: traffic that isn't explicitly permitted at the VPC boundary is either dropped, or handed off with a **Jump to Application** action — meaning the VPC-level profile defers the final decision to the Application category `FirewallPolicy`. This is important to know, because if an application category policy does not exist, traffic that matches the **Jump to Application** rule in the Environment category will be allowed by default. As the Security Profiles DFW policies have the lowest priority in the Environment section, any custom-created policy and rule will have precedence for traffic inspection. This provides the flexibility for the tenant admin to customize the overall VPC security strategy when it is needed.
 
-The architectural payoff: a tenant's entire VPC security posture is one small, human-readable object — the `SecurityProfileAttachment`. It can be reviewed in a pull request, reconciled by a GitOps controller, and audited from Git history — with no free-text firewall rule authoring exposed to the tenant at all.
+The two-tier model — a coarse, tenant admin selected VPC posture, plus a fine-grained, workload-scoped application policy — is what lets a single security profile serve very different applications' protection needs.
 
 **API example.** A Tenant Admin (or their automation) reads the available profiles and the current attachment for their VPC:
 
@@ -192,7 +199,7 @@ kubectl patch securityprofileattachment vpc-dev -p \
   '{"spec":{"securityProfileName": "system-security-profile-2--m01-reg01"}}'
 ```
 
-A platform team can also designate an org-wide default strategy and independently toggle the VPC Gateway (north-south) Firewall for a profile:
+This is the platform-owned half of the same catalog a tenant only ever selects from: a platform team can also designate an org-wide default strategy and independently toggle the VPC Gateway (north-south) Firewall for a profile:
 
 ```bash
 kubectl patch securityprofile system-security-profile-4--m01-reg01 -p \
@@ -216,8 +223,6 @@ spec:
     - 10.10.0.0/16
   regionName: m01-reg01
 ```
-
-**Confirmed limitations:** the "VPC Isolation" strategy's interaction with private-VPC-subnet workloads exposed via DNAT or a load balancer needs to be verified in your own environment rather than assumed; "VPC Secure Connection" does not extend to private-VPC-subnet workloads' cross-VPC communication; and a `FirewallPolicy`/`VPCGatewayFirewallPolicy` generated by a profile cannot be edited directly — customization requires a **separate**, higher-priority policy authored *before* it, never a patch to the generated policy itself.
 
 ### 5.2 Namespace Segmentation
 
