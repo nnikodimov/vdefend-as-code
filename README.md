@@ -155,13 +155,13 @@ The schema in this paper is confirmed against a running VCF 9.1 environment (liv
 
 ---
 
-## 5. Use Cases and Design Patterns for vDefend Security
+## 5. Security Use Cases and Design Patterns
 
 Each subsection below walks through one concrete use case for consuming vDefend security through the VCFA Consumption API: what a tenant needs, the design pattern that solves it, and the API objects that implement it — confirmed against a live VCF 9.1 environment. §6 and §7 then show how Terraform and Argo CD actually deliver each pattern; this section stays at the level of the API itself.
 
-### 5.1 VPC Segmentation via vDefend Security Profiles
+### 5.1 VPC Segmentation
 
-The foundation of the self-service model is a small, fixed catalog of **system-defined Security Profiles**, each representing a named security *strategy* for a VPC's north-south and VPC-to-VPC traffic. A Tenant Admin does not write DFW rules — they select a strategy, and the platform materializes the underlying policy.
+The foundation of the vDefend self-service model is a small, fixed catalog of **system-defined Security Profiles**, each representing a named security *strategy* for a VPC's north-south and VPC-to-VPC traffic. A Tenant Admin does not write DFW rules — they select a strategy, and the platform materializes the underlying policy.
 
 The five strategies, from most to least restrictive:
 
@@ -835,73 +835,7 @@ Multi-tenant security in VCF 9.1 works when it is designed as a set of composabl
 
 ---
 
-## Appendix A. VCFA/CCI API Reference
-
-The authoritative, current source for this API is Broadcom's CCI API documentation: [developer.broadcom.com/xapis/cci-api](https://developer.broadcom.com/xapis/cci-api/latest/api-docs.html#k8s-api-vpc-nsx-vmware-com-v1alpha1) — verify field-level details there before an automation module hard-codes an assumption this reference doesn't cover. What follows is the field-by-field detail behind the constructs introduced in §3.2, confirmed against a running VCF 9.1 environment.
-
-### A.1 `NetworkSecurityGroup` / `VPCNetworkSecurityGroup` — the reusable "who"
-
-The verified schema splits this into **two** kinds, scoped differently:
-
-- **`NetworkSecurityGroup`** is scoped by a required `spec.regionName` (not a VPC). `FirewallPolicy` (east-west/DFW) and `TGWFirewallPolicy` (inter-VPC) rules reference these by name.
-- **`VPCNetworkSecurityGroup`** is scoped by a required `spec.vpcName` instead. `VPCGatewayFirewallPolicy` (north-south perimeter) rules reference these instead of the region-scoped kind.
-
-Both kinds share the same membership shape: static `ipAddresses[]` (single IPs, ranges, or CIDRs), static `vms[]` (by `instanceUUID`), dynamic `vmSelectors[]`/`podSelectors[]` (each a `labelSelector` and/or `namespaceSelector`, plus a VM-only `propertySelector` matching on `Name`/`OSName`/`ComputerName`), and nested group references (`networkSecurityGroupNames[]`/`vpcNetworkSecurityGroupNames[]`). There is no `memberSelector` wrapper — these are all top-level `spec` fields.
-
-**Free namespace-scoped grouping via auto-tags.** VCFA automatically tags every VM's network interface with `kubernetes.io/metadata.name: <namespace name>` and `nsx-op/vm_namespace: <namespace name>` the moment it's deployed into a vSphere Namespace — no manual labeling required (used throughout §5.2 and §5.4). Confirmed limitations: this pattern does not work for VKS cluster nodes (grouped via separate, auto-generated tags) or for workloads on a shared VPC subnet.
-
-### A.2 `SecurityProfile` + `SecurityProfileAttachment` — the VPC's security posture
-
-`SecurityProfile` is a standalone, `regionName`-scoped object — it does nothing on its own. `SecurityProfileAttachment` (`regionName` + `securityProfileName` + `vpcName`, all required) is what binds it to a VPC. `SecurityProfileSpec` controls VPC-wide enforcement behavior — whether the north-south firewall is enabled, and which east-west strategy applies (`none`, `vpc-isolation`, `vpc-secure-connection`, `vpc-isolation-with-essential-services`, `vpc-external-connectivity`). There is no `tcpStrict` field here (that's per-firewall-policy-kind) and no Malware Prevention profile reference field in this API group.
-
-Confirmed from a live region — exactly five pre-created, system-owned `SecurityProfile` objects exist, one per strategy:
-
-```
-NAME                                    SECURITY STRATEGIES                    NORTHSOUTHFIREWALL ENABLED
-default--m01-reg01                      none                                    false
-system-security-profile-2--m01-reg01    vpc-isolation                           false
-system-security-profile-3--m01-reg01    vpc-isolation-with-essential-services   false
-system-security-profile-4--m01-reg01    vpc-external-connectivity               false
-system-security-profile-5--m01-reg01    vpc-secure-connection                   false
-```
-
-A tenant picks a posture by pointing `SecurityProfileAttachment.spec.securityProfileName` at one of these — not by authoring custom strategy values. Confirmed limitations: a `FirewallPolicy`/`VPCGatewayFirewallPolicy` generated by a `SecurityProfile` cannot be edited or have rules appended directly (customize via a separate, higher-priority policy instead); essential-services rules always allow both directions; and every generated rule terminates in `JumpToApplication`, so `vpc-secure-connection`/`vpc-external-connectivity` fail closed without an explicit tenant `Application`-category allow rule.
-
-### A.3 `FirewallPolicy` — east-west (Distributed Firewall) rules
-
-Holds an ordered `rules[]` list; each rule's `from`/`to` are arrays of single-peer objects (`{ groupName: ... }` or `{ ipAddress: ... }`), not flat string lists. Port/protocol matching nests under `services[].l4PortSet` or a `networkServiceName` reference. `spec.category` (`Infrastructure` | `Environment` | `Application`) determines evaluation order — policies are evaluated top-down in that fixed sequence, so an `Infrastructure`-category rule is always checked before an `Application`-category one.
-
-### A.4 `VPCGatewayFirewallPolicy` — north-south perimeter rules
-
-Same rule shape as `FirewallPolicy`, but scoped to the VPC's own gateway and referencing `VPCNetworkSecurityGroup` (not `NetworkSecurityGroup`) in `groupName` peers. Both `spec.regionName` and `spec.vpcName` are required.
-
-### A.5 `TGWFirewallPolicy` — inter-VPC rules on a shared Transit Gateway
-
-No `spec.transitGateway` field exists on `TGWFirewallPolicySpec` — a rule scopes itself to a specific Transit Gateway attachment via `appliedTo.gatewayAttachmentNames[]`/`gatewayNames[]`. Groups referenced in `from`/`to` are the region-scoped `NetworkSecurityGroup`. Requires the appropriate vDefend/Advanced Cyber Compliance licensing tier.
-
-### A.6 `NetworkService` — reusable service/port definitions
-
-`NetworkServiceSpec.serviceEntries[]` accepts exactly one of five shapes per entry: `l4PortSet` (TCP/UDP + ports), `icmp`, `ipProtocol` (raw IP protocol numbers), `alg` (Application Layer Gateway protocols), or `igmp`. Custom `NetworkService` creation has been observed to reject at least some arbitrary TCP ports (e.g. `6443`) — verify before depending on it in a pipeline.
-
-### A.7 `NetworkSecurityGroupIPMembers` / `VPCNetworkSecurityGroupIPMembers` — realized membership (read-only)
-
-Read-only subresources reporting the IPs a group's selectors actually resolved to. Useful as a post-apply CI check: assert non-empty before promoting a paired `FirewallPolicy` change that references the group, to catch a typo'd selector before it reaches production.
-
-### A.8 `TGWSecurityConfig` — the Transit Gateway firewall on/off switch
-
-A subresource of `TransitGateway`: `spec.features[]` is a list of `{ name, enabled }` pairs, with `GatewayFirewall` the only documented value. Gates all `TGWFirewallPolicy` enforcement on that gateway.
-
-### A.9 `VPCConnectivityProfile` / `VPCConnectivityProfileBinding` — VPC north-south connectivity posture
-
-Governs a VPC's outward connectivity (`externalIPBlockNames[]`, `transitGatewayName`, `serviceGateway`/NAT config). `VPCConnectivityProfileBinding` binds a named profile to a Project/namespace. This schema version has no explicit `Community`/`Isolated`/`Promiscuous`-style isolation-mode field on the profile itself — confirm placement with `kubectl explain` before assuming where that toggle lives in your build.
-
-### A.10 `RegionNetworkingCapabilities` — capability discovery
-
-Read-only, one object per Region: `capabilities[]` array of `{ type, state, reason, message }`. Useful as a pre-flight check before generating manifests that depend on a region-specific capability.
-
----
-
-## Appendix B. Glossary
+## Appendix A. Glossary
 
 | Term | Meaning |
 |---|---|
@@ -927,7 +861,7 @@ Read-only, one object per Region: `capabilities[]` array of `{ type, state, reas
 
 ---
 
-## Appendix C. Additional Resources
+## Appendix B. Additional Resources
 
 - Broadcom Developer Portal — [CCI API Reference (`xapis/cci-api`, `vpc.nsx.vmware.com/v1alpha1`)](https://developer.broadcom.com/xapis/cci-api/latest/api-docs.html#k8s-api-vpc-nsx-vmware-com-v1alpha1)
 - Broadcom TechDocs — [Firewall Policies in an NSX VPC](https://techdocs.broadcom.com/us/en/vmware-cis/nsx/vmware-nsx/9-0/administration-guide/nsx-multi-tenancy/nsx-virtual-private-clouds/firewall-policies-in-an-nsx-vpc.html)
