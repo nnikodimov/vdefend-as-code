@@ -117,17 +117,15 @@ This principle applies equally to machine and automation identities (§6, §7). 
 
 ## 4. Consuming vDefend Through the CCI API
 
-§3.2 described *what* the vDefend security constructs are. This section covers *how* they are addressed: the API surface a tenant, a Terraform run, or a GitOps controller actually talks to. It is deliberately short — reference material to make §5–§8 legible, not the paper's main subject. The field-by-field spec is in Appendix A.
-
 ### 4.1 CCI as a Standard Kubernetes API Server
 
-VCFA's **Cloud Consumption Interface (CCI)** is a real Kubernetes API server, not a proprietary REST API with a UI bolted in front of it — a developer-centric IaaS consumption layer that aggregates multi-cluster vSphere Supervisors into a single, unified API endpoint. A tenant (or a pipeline) authenticates and receives a **kubeconfig context scoped to their own vSphere Namespace** — nothing else is visible — via a token exchange (the `vcfa_kubeconfig` Terraform data source is the mechanism §6 uses). From there, any standard Kubernetes tooling works against it directly: `kubectl`, any Kubernetes client library, Terraform's `kubernetes` provider, or a GitOps controller like Argo CD. No vDefend-specific SDK is required.
+VCFA's **Cloud Consumption Interface (CCI)** is a native Kubernetes API server aggregator delivering a developer-centric IaaS consumption fabric that unifies multi-cluster vSphere Supervisors into a single API endpoint. A tenant (or a pipeline) authenticates and receives a **kubeconfig context scoped to their own vSphere Namespace** — nothing else is visible — via a token exchange (the `vcfa_kubeconfig` Terraform data source is the mechanism §6 uses). Consequently, standard Kubernetes ecosystem tooling operates against CCI directly — including kubectl, native client libraries, Terraform, and GitOps controllers like Argo CD — without requiring proprietary SDKs.
 
-In CCI, the Organization acts as the parent container for VCFA Projects: authentication tokens (whether from a `kubectl` login flow or a Terraform run) evaluate against a user or pipeline's assigned Organization and Project membership. The Organization itself is an administrative and identity domain managed at the VCFA governance tier, so — unlike the Project (`project.cci.vmware.com`, §4.2) — it is not instantiated as its own Kubernetes Custom Resource Definition (CRD).
+Within CCI structural hierarchy, the Organization serves as the top-level identity and administrative container for VCFA Projects. Authentication tokens — whether generated during a CLI login session or an automated Terraform pipeline run — evaluate directly against a subject's assigned Organization and Project role bindings (`ProjectRoleBinding`). Because the Organization is managed at the VCFA governance tier, it is not instantiated as an in-cluster Custom Resource Definition (CRD), unlike the Project resource (`project.cci.vmware.com`, §4.2), which exists natively as a declarative object within the CCI control plane.
 
 ### 4.2 The API Groups
 
-CCI presents the constructs from §3 across a handful of API groups, split by who owns them:
+CCI presents the constructs discussed in §3 across a handful of API groups. Tenants require no proprietary clients or vendor-specific SDKs. Standard Kubernetes tooling — whether `kubectl apply`, Terraform's `kubernetes_manifest` resource, or a GitOps controller like Argo CD — manages workload primitives like a `Deployment` and network security constructs like a `FirewallPolicy` using the exact same declarative workflow.
 
 | API group | Purpose |
 |---|---|
@@ -136,8 +134,6 @@ CCI presents the constructs from §3 across a handful of API groups, split by wh
 | `authorization.cci.vmware.com` | RBAC / role bindings scoped to a Project or namespace |
 | `vpc.nsx.vmware.com/v1alpha1` | **VPC networking and security**: `VPC`, `Subnet`, `NetworkSecurityGroup`/`VPCNetworkSecurityGroup`, `NetworkService`, `SecurityProfile`/`SecurityProfileAttachment`, `FirewallPolicy`, `VPCGatewayFirewallPolicy`, `TGWFirewallPolicy`/`TGWSecurityConfig`, `VPCConnectivityProfile`/`Binding` |
 | `vmoperator.vmware.com/v1alpha3` | VM lifecycle — the workloads the security policy protects |
-
-Everything this paper automates lives in `vpc.nsx.vmware.com/v1alpha1`. The practical consequence is that a tenant needs no vDefend-specific client: the same `kubectl apply`, the same Terraform `kubernetes_manifest`, and the same GitOps controller that handle a Deployment handle a `FirewallPolicy`.
 
 ### 4.3 Security Capabilities and the Kinds That Express Them
 
@@ -151,27 +147,11 @@ Each capability from §3.2 is addressed through one or two custom resource kinds
 | Security Profile | `SecurityProfile` + `SecurityProfileAttachment` | The profile is inert; the attachment binds it to a VPC |
 | Group | `NetworkSecurityGroup` (Region-scoped) / `VPCNetworkSecurityGroup` (VPC-scoped) | Gateway rules reference the VPC-scoped kind; DFW and TGW rules the Region-scoped one |
 | Service | `NetworkService` | Referenced by name from any rule's service list |
-| Label | *(no kind of its own)* | An attribute on the workload object; groups select on it |
-| VPC connectivity posture | `VPCConnectivityProfile` + `Binding` | Governs what is *routable* before any rule governs what is permitted |
-
-**Where these objects live.** This is the detail most often assumed wrongly. Security objects are *not* nested inside the VPC or the vSphere Namespace they protect. They are created in the tenant's own namespace representing the whole Organization/Project, and they point at their target by name or label selector:
-
-```
-Project  (the tenant's own namespace — where every object below is created)
- │
- ├─ SecurityProfile + SecurityProfileAttachment    ── attaches a posture to ──>  a VPC
- ├─ NetworkSecurityGroup / VPCNetworkSecurityGroup ── selects ──>  workloads, by label / IP / nesting
- ├─ NetworkService                                 ── referenced by ──>  any rule's service list
- ├─ FirewallPolicy                                 ── enforced at ──>  the Distributed Firewall
- ├─ VPCGatewayFirewallPolicy                       ── enforced at ──>  the VPC gateway
- └─ TGWFirewallPolicy (+ TGWSecurityConfig)        ── enforced at ──>  the shared Transit Gateway
-```
-
-A `FirewallPolicy` targets a particular namespace's workloads through a label selector or a VPC/Region reference in its spec — not by being created inside that namespace. The enforced tenancy boundary therefore sits at the Organization's own namespace, which is exactly what §3.3 secures.
+| Label (Protected) | *(no kind of its own)* | An attribute on the workload object; groups select on it |
 
 ### 4.4 A Note on Source Grounding
 
-The schema in this paper is confirmed against a running VCF 9.1 environment (live `kubectl get` output, reproduced in §5) rather than assumed from documentation alone. The authoritative, current reference is Broadcom's published CCI API documentation at `developer.broadcom.com/xapis/cci-api` (linked in Appendix C) — check it directly before an automation module hard-codes an assumption this paper doesn't cover.
+The schema in this paper is confirmed against a running VCF 9.1 environment (live `kubectl get` output, reproduced in §5) rather than assumed from documentation alone. The authoritative, current reference is Broadcom's published CCI API documentation at `https://developer.broadcom.com/xapis/cci-api/latest/api-docs.html` — check it directly before an automation module hard-codes an assumption this paper doesn't cover.
 
 ---
 
