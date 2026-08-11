@@ -288,13 +288,17 @@ spec:
 
 ### 5.3 Application Ringfencing
 
-The final, finest-grained tier is the application itself. Where namespace isolation answers "can namespace A talk to namespace B," application ringfencing answers "which of the workloads inside my own namespace can talk to each other." The pattern mirrors namespace segmentation but groups on an explicit label instead of the auto-assigned namespace tag.
+In modern multi-tenant cloud security architecture, boundary enforcement operates across a strict hierarchy of abstraction tiers. While namespace isolation addresses macro-level perimeter boundaries, application ringfencing governs intra-boundary lateral communication, determining precisely which workload instances within a given namespace or across logical boundaries are permitted to interact. The underlying mechanism of application ringfencing pivots from structural, platform-assigned organization tags to explicit metadata labels attached directly to workload entities.
 
-This is the layer where "self-service security" is most literal: labelling a VM is all it takes to place it inside a ringfence, and through a thin abstraction (a catalog item, a Terraform module, or a GitOps overlay — §6 and §7) the app-scoped `NetworkSecurityGroup` and `FirewallPolicy` follow — with nobody touching NSX Manager or filing a firewall-change ticket.
+Through declarative abstraction mechanisms — such as VCFA service catalog items, Terraform modules, or GitOps overlay manifests — security boundaries follow workload deployment pipelines automatically without requiring administrative overhead. When a workload is provisioned or modified, the attachment of a metadata label triggers dynamic evaluation. The platform evaluates key-value pairs and automatically assigns the workload to pre-defined Groups and app-scoped vDefend Distributed Firewall Policies. The application-scoped firewall policy automatically expands or contracts as instances are scaled horizontally, ensuring continuous compliance across the workload lifecycle.
 
-Whether that label is an ordinary one or a **protected** one (§3.2) is the design decision worth making deliberately. An ordinary label lets the application team place and move their own workloads freely — maximum autonomy, but a team can also label its way out of its own ringfence. A protected label, assigned by the Organization Admin or Organization Security Admin, makes the ringfence something the application team operates *inside* rather than *controls*. The examples below use the protected form, which is the right default whenever the ringfence exists to satisfy an obligation the tenant's own security owner is accountable for.
+VCFA general tag management is unconstrained; an application team can inadvertently or deliberately modify a label. This capability creates potential vectors for security boundary evasion and accidental exposure of internal services.
 
-Where an application maps one-to-one onto a namespace, application segmentation is namespace segmentation (§5.2) by another name. Where it doesn't — an app spanning multiple namespaces, or a namespace hosting multiple apps that shouldn't reach each other — **app ringfencing** groups by that label instead of the namespace tag:
+Protected security labels establish strict Role-Based Access Control (RBAC) over label administrative lifecycles. In VCFA, protected labels can only be created, assigned, or modified by authorized administrative roles, specifically the Organization Admin or Organization Security Admin.
+
+When protected labels are enforced, the application security becomes an immutable policy envelope. The application team operates within a security boundary defined and audited by the organization's security authority, rather than maintaining control over the boundary itself. Consequently, protected labels represent the imperative operational default whenever application security posture is deployed to fulfill regulatory requirements (such as PCI-DSS, HIPAA, or NIST SP 800-207 Zero Trust frameworks) or contractual security obligations for which the tenant security owner is ultimately accountable.
+
+In deployments where an application maps strictly to a single namespace, application ringfencing acts as an internal refinement of namespace segmentation (§5.2). The namespace establishes the coarse macro-perimeter, while application ringfencing uses metadata labels to divide the application into discrete, microsegmented tiers (such as web, application, and database tiers). In this scenario, application segmentation and namespace segmentation operate in complete structural alignment.
 
 ```bash
 kubectl label virtualmachines prod01-vm01 protected/app01=backend
@@ -571,7 +575,7 @@ Restating, per §5 pattern, exactly what Terraform provisions at day-0:
 - **Day-0 Provisioned Security (§5.4):** owns both the group and the policy as part of the tenant baseline, exactly like the namespace pattern above — the only difference is the selector (`protected/env`, an explicit label) rather than the automatic namespace tag.
 - **Transit Gateway (§5.5):** `TGWSecurityConfig` is an Organization-level object, provisioned once for the Organization rather than per VPC, so it belongs in the tenant onboarding baseline alongside the Project and VPCs. A pre-merge check in the tenant GitOps pipeline should reject a `TGWFirewallPolicy` PR if the target gateway's `TGWSecurityConfig` isn't already enabled; otherwise the rules merge cleanly and silently do nothing.
 
-Application Segmentation & Ringfencing (§5.3) has no Terraform-owned piece — see §7.6.
+Application Ringfencing (§5.3) has no Terraform-owned piece — see §7.6.
 
 ---
 
@@ -677,7 +681,7 @@ Restating, per §5 pattern, exactly what Argo CD reconciles at day-2:
 
 - **VPC Segmentation (§5.1):** a strategy change — e.g. moving a `dev` VPC from `none` to `vpc-isolation` — is a one-line diff to `SecurityProfileAttachment.spec.securityProfileName` in the tenant's Git path, synced automatically.
 - **Namespace Segmentation (§5.2):** any `Application`-category rule opening a specific port between namespaces is added as a normal PR against the tenant's policy repo; the `Environment`-category isolation policy still governs anything not explicitly matched.
-- **Application Segmentation & Ringfencing (§5.3):** because a new application being ringfenced is exactly the kind of change that happens continuously as a tenant's portfolio grows, this is squarely an Argo CD-owned change — a PR adding the app's group and policy to the tenant's Git path, reviewed by `CODEOWNERS`, synced automatically.
+- **Application Ringfencing (§5.3):** because a new application being ringfenced is exactly the kind of change that happens continuously as a tenant's portfolio grows, this is squarely an Argo CD-owned change — a PR adding the app's group and policy to the tenant's Git path, reviewed by `CODEOWNERS`, synced automatically.
 - **Transit Gateway (§5.5):** tenant-specific `TGWFirewallPolicy` rules are layered in the same way as any other tenant policy change, reviewed and synced from the tenant's Git path.
 
 Day-0 Provisioned Security (§5.4) is fully owned by Terraform at onboarding — see §6.5.
