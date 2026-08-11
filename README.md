@@ -224,18 +224,22 @@ spec:
   regionName: m01-reg01
 ```
 
-### 5.2 Namespace Segmentation
+### 5.2 vSphere Namespace Segmentation
 
-Every vSphere Namespace is tied to exactly one VPC and one namespace class at creation time, but that VPC assignment is a per-namespace choice, not a fixed platform rule — VCFA supports two design blueprints, and a platform team can mix both within the same Project:
+The vSphere Namespace serves as the primary administrative and logical boundary for resource allocation, access control, and multi-tenant workload isolation within the vSphere Supervisor. At creation time, every vSphere Namespace is bound to two fundamental construct definitions: a VPC assignment and a specific Namespace Class. A Namespace Class establishes the compute, memory, and storage quotas, VM classes, storage policies, and content libraries available to the namespace; it imposes no structural constraints or dependencies on the underlying network topology.
 
-- **Dedicated VPC** — one VPC per namespace (or per small group of namespaces), for stricter isolation. Namespace segmentation and VPC segmentation are the same boundary here, so the Security Profile attached to the VPC *is* the namespace's security posture (§5.1), and there is no need to layer a separate namespace-scoped `FirewallPolicy` on top for east-west isolation between namespaces — there's only ever one namespace in the VPC to isolate from.
-- **Shared VPC** — multiple namespaces share one VPC's address space and gateway, for cases where network separation between those namespaces isn't required. This is the common case for a "prod" VPC hosting several related application namespaces (e.g., `prod01`, `prod02`) that want to share transit/gateway configuration and quota pooling, but still need their own east-west isolation from each other without provisioning a VPC per namespace.
+Platform teams have the operational flexibility to evaluate and assign VPC boundaries on a per-namespace basis, choosing between two basic architecture blueprints: a Dedicated VPC model and a Shared VPC model.
 
-The decision is fundamentally about isolation versus sharing: pick Dedicated VPC when a namespace needs its own network boundary (e.g., a namespace whose tenant, compliance scope, or blast-radius requirement doesn't tolerate sharing a gateway with anything else); pick Shared VPC when several namespaces belong to the same trust boundary and gain more from pooled quota and simpler topology than from a hard network split. Namespace class (CPU/memory/storage limits, VM classes, storage classes, content libraries) is a separate, parallel provisioning decision from VPC assignment — choosing a namespace class does not constrain or imply which VPC blueprint a namespace uses.
+In the Dedicated VPC model, the namespace boundary and the network VPC boundary are structurally identical, providing isolated perimeter security via the VPC's Security Profile. In the Shared VPC model, multiple namespaces inhabit a single VPC, allowing applications to pool quota and share transit configurations while relying on micro-segmentation for east-west isolation. The decision to deploy either model hinges on a fundamental trade-off between strict perimeter isolation and resource efficiency.
 
-Dedicated VPC namespaces already get `SecurityProfile`-driven isolation for free (§5.1) — there's nothing further to author. The API example below applies to the Shared VPC case: because the VPC-level `SecurityProfile` only governs traffic crossing the *VPC* boundary, namespaces sharing that VPC are otherwise free to reach each other unless a namespace-scoped `FirewallPolicy` says otherwise.
+- **Dedicated VPC** — the blueprint establishes a strict one-to-one mapping between a vSphere Namespace and a VPC. vDefend Security Profiles (§5.1) attached directly to the VPC can govern ingress and egress traffic crossing the VPC boundary, serving as the explicit security posture for the contained namespace. Because no other application namespaces reside within the same VPC address space, east-west network isolation between namespaces is guaranteed by the vDefend Security Strategy chosen.
+- **Shared VPC** — the Shared VPC blueprint enables multiple vSphere Namespaces to occupy a single VPC address space, sharing a common VPC Gateway. This pattern is commonly deployed for application ecosystems that belong to a single administrative trust boundary (such as related production namespaces `prod01` and `prod02`). Consolidating namespaces into a shared VPC optimizes IP address space allocation, simplifies overall network routing, and allows for pooled network resource quotas. The traffic moving between subnets inside the same VPC is natively routed across distributed switches without traversing the VPC Gateway firewall. All Security Profiles have a default strategy to conditionally allow (**Jump to Application**) intra-VPC traffic, relying on more-granular DFW application category policies when such segmentation is required. To prevent unrestricted lateral movement between VPC co-located namespaces, platform teams must therefore deploy namespace-scoped Distributed Firewall (DFW) policies.
 
-In the Shared VPC model, VCFA auto-tags every workload with its owning namespace (`kubernetes.io/metadata.name`, `nsx-op/vm_namespace`). Because that tag is applied automatically to every existing and future VM deployed into the namespace, a platform team can build namespace isolation once, generically, using a label-selector-based `NetworkSecurityGroup` — no per-workload rule maintenance required:
+To bypass the operational burden of manually tracking IP address allocations when provisioning workloads, the Supervisor incorporates an automated infrastructure metadata tagging mechanism. When virtual machines, container hosts, or network interfaces are provisioned within a vSphere Namespace, the Supervisor automatically attaches standardized key-value tags to the underlying network constructs. In VCF Networking with VPC stack deployments, the Supervisor automatically applies the tag `nsx-op/vm_namespace` set to the namespace's name on every VPC subnet segment port created within that namespace. In deployments utilizing NSX Classic mode or legacy segment models, the system tags the NSX Segment directly using the scope `kubernetes.io/metadata.name`.
+
+These auto-generated tags enable security architects to construct generic, dynamic Groups using label selectors. Rather than defining static IPv4 objects, the dynamic Group matches any segment port where the tag key `nsx-op/vm_namespace` equals the target namespace identifier.
+
+As new Virtual Machines or VKS clusters scale up within the namespace, their interfaces automatically inherit the namespace tag and fall under the enforcement of the corresponding security policies.
 
 ```yaml
 apiVersion: vpc.nsx.vmware.com/v1alpha1
@@ -248,7 +252,11 @@ spec:
     - labelSelector:
         matchLabels:
           nsx-op/vm_namespace: prod01-8sg7f
----
+```
+
+Implementing segmentation across namespaces sharing a single VPC requires configuring Distributed Firewall (DFW) policy at the Tenant scope. The Organization Admins author the namespace isolation policy in the `Environment` category, to ensure security baseline precedence.
+
+```yaml
 apiVersion: vpc.nsx.vmware.com/v1alpha1
 kind: FirewallPolicy
 metadata:
@@ -276,11 +284,9 @@ spec:
       services: [{ networkServiceName: Any }]
 ```
 
-Because this isolation policy lives in the `Environment` category, not `Application`, it sits above the application team's RBAC scope (§3.3): the Organization's own admins author and own it, while an application owner can layer `Application`-category rules on top for cross-namespace exceptions but cannot edit the isolation baseline itself. Together, this pair makes "one namespace = one blast-radius" true before the first workload ever lands.
+**Note:** A primary operational complexity in Shared VPC topologies arises from handling non-deterministic IP services, such as Load Balancer Virtual Servers and Source Network Address Translation (SNAT) endpoints. By default, NSX assigns Load Balancer services and outbound SNAT IPs dynamically from the Project's shared External IP block. Because these ingress and egress IP addresses are allocated dynamically, dynamic segment port matching must be paired with explicit "IP Addresses Only" groups to account for Virtual IP (VIP) targets in cross-namespace firewall policies.
 
-**Confirmed limitation:** the namespace-tag grouping pattern does **not** work for VKS cluster nodes (grouped via separate, auto-generated tags instead) or for workloads on a *shared* VPC subnet — plan a separate grouping strategy for those before assuming one pattern covers a whole tenant.
-
-### 5.3 Application Segmentation & Ringfencing
+### 5.3 Application Ringfencing
 
 The final, finest-grained tier is the application itself. Where namespace isolation answers "can namespace A talk to namespace B," application ringfencing answers "which of the workloads inside my own namespace can talk to each other." The pattern mirrors namespace segmentation but groups on an explicit label instead of the auto-assigned namespace tag.
 
