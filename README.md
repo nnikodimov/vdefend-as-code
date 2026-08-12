@@ -12,7 +12,7 @@ This paper is written for cloud and platform architects who already know their w
 - **Declarative APIs:** Exposing vDefend security features available for VCFA tenants through the Cloud Consumption Interface (CCI) and standard Kubernetes Custom Resource Definitions (CRDs).
 - **Layered Multi-Tenancy:** Layering VCFA constructs, like namespaces and applications with Virtual Private Cloud (VPC) and vDefend security posture, so that Providers can properly plan and impose the required infrastructure guardrails, while preserving the tenants' flexibility to define their individual applications' protection without interfering with the infra-wide security baseline.
 - **Day-0 Security Baseline:** Enforcing security policies at resource creation time so that workloads are protected immediately upon deployment.
-- **Automated Lifecycle Operations:** Delivering end-to-end policy management using Terraform for Day-0 and Day-1 deployment, and Argo CD for Day-2 continuous GitOps reconciliation.
+- **Automated Lifecycle Operations:** Delivering end-to-end policy management with Terraform alone — from Day-0 provisioning through Day-2 change — with GitOps-based continuous reconciliation available as an optional pattern for platform teams that want it.
 
 The result is a model where security is not a gate that slows down self-service infrastructure — it is one of the things being self-served, inside guardrails the platform team controls centrally and exposes through the same API surface as compute, network, and storage.
 
@@ -111,7 +111,7 @@ Three integrated mechanisms establish and maintain strict isolation between tena
 
 Each persona receives a kubeconfig context scoped strictly to the specific namespaces permitted by their ProjectRoleBinding (authorization.cci.vmware.com). Consequently, the same token that authorizes a developer to deploy a workload also acts as the boundary constraining their visibility across the platform. Resources outside a persona's assigned scope are neither writable nor discoverable through API enumeration — a key requirement that allows platform providers to safely expose standard Kubernetes API endpoints directly to tenants.
 
-This principle applies equally to machine and automation identities (§6, §7). Whether provisioning infrastructure via a Terraform CI runner using a Cloud Consumption Interface (CCI) token or executing GitOps syncs through an Argo CD service account, automation credentials must be scoped strictly to the specific tenant namespace(s) they manage. Granting a pipeline Project-wide or Region-wide administrative credentials — even for platform-owned CI/CD runners — introduces a major security anti-pattern: it quietly undermines the tenant isolation model by creating a backchannel for privilege escalation beyond human authorization boundaries.
+This principle applies equally to machine and automation identities (§6, Appendix A). Whether provisioning infrastructure via a Terraform CI runner using a Cloud Consumption Interface (CCI) token, or executing GitOps syncs through an Argo CD service account for teams layering on Appendix A's optional pattern, automation credentials must be scoped strictly to the specific tenant namespace(s) they manage. Granting a pipeline Project-wide or Region-wide administrative credentials — even for platform-owned CI/CD runners — introduces a major security anti-pattern: it quietly undermines the tenant isolation model by creating a backchannel for privilege escalation beyond human authorization boundaries.
 
 ---
 
@@ -157,7 +157,7 @@ The schema in this paper is confirmed against a running VCF 9.1 environment (liv
 
 ## 5. Use Cases and Design Patterns
 
-Each subsection below walks through one concrete use case for consuming vDefend security through the VCFA Consumption API: what a tenant needs, the design pattern that solves it, and the API objects that implement it — confirmed against a live VCF 9.1 environment. §6 and §7 then show how Terraform and Argo CD actually deliver each pattern; this section stays at the level of the API itself.
+Each subsection below walks through one concrete use case for consuming vDefend security through the VCFA Consumption API: what a tenant needs, the design pattern that solves it, and the API objects that implement it — confirmed against a live VCF 9.1 environment. §6 then shows how Terraform delivers each pattern, day-0 and day-2 alike (Appendix A covers an optional GitOps-based alternative for continuous reconciliation); this section stays at the level of the API itself.
 
 ### 5.1 VPC Segmentation
 
@@ -439,13 +439,11 @@ The concrete escape hatch worth calling out explicitly: **a policy created by a 
 
 ---
 
-## 6. Implementing Day-0 Provisioning with Terraform
+## 6. Implementing Security with Terraform
 
-*(core technical section #1)*
+### 6.1 Why Terraform for the Full Tenant Security Lifecycle
 
-### 6.1 Why Terraform for the Tenant Security Baseline
-
-Terraform fits naturally where tenant security config is provisioned **as part of** environment stand-up — a "new tenant" pipeline that creates the Project, VPC, Subnets, quotas, and the baseline `SecurityProfile`/`NetworkSecurityGroup`/default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy` set in one atomic `apply`, with the safety of `plan` review and state-tracked drift detection. Run that `apply` inside a CI job gated by the same pull-request review every other infrastructure change goes through, and the whole tenant shell — including its day-0 security posture — becomes a reviewed, reproducible artifact instead of a runbook someone follows by hand. For platform teams that already run multi-cloud IaC on Terraform, this means zero new tooling to onboard a tenant securely on day one.
+Terraform fits naturally where tenant security config is provisioned **as part of** environment stand-up — a "new tenant" pipeline that creates the Project, VPC, Subnets, quotas, and the baseline `SecurityProfile`/`NetworkSecurityGroup`/default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy` set in one atomic `apply`, with the safety of `plan` review and state-tracked drift detection. Run that `apply` inside a CI job gated by the same pull-request review every other infrastructure change goes through, and the whole tenant shell — including its day-0 security posture — becomes a reviewed, reproducible artifact instead of a runbook someone follows by hand. For platform teams that already run multi-cloud IaC on Terraform, this means zero new tooling to onboard a tenant securely on day one — and the same module, the same `plan`/`apply` gate, and the same pull-request review keep governing every day-2 change made to that tenant's security posture afterward (§6.4, §6.5, §7). There is no second tool to introduce once the tenant exists; Appendix A covers an optional GitOps-based alternative for teams that want continuous, always-on reconciliation on top of this.
 
 ### 6.2 Provider Chain
 
@@ -564,26 +562,227 @@ This is illustrative of the pattern — provision the profile, bind it to a VPC,
 
 - **One Terraform workspace/state per tenant Project**, keyed by tenant ID — never a single monolithic state file spanning tenants. This bounds blast radius: a bad `apply` for one tenant can't corrupt another's state, and it lets pipelines run in parallel.
 - Wrap the resources above in a `tenant-vdefend-baseline` module with variables for tier labels, allowed ports, and default-deny posture, versioned in a shared module registry so every tenant onboarding starts from the same vetted security baseline.
-- Once Argo CD (§7) takes ownership of a resource's steady-state reconciliation, stop managing that same object from Terraform to avoid field-ownership fights — see §7.5.
+- Terraform remains the sole owner of every object in this baseline across the tenant's whole lifecycle — day-0 provisioning and every day-2 change alike (§6.5, §7) — rather than handing steady-state reconciliation off to a second tool. Appendix A shows an optional alternative for platform teams that want an always-on, continuous reconciliation loop beyond periodic `apply`.
 
 ### 6.5 Applying Terraform to Each Design Pattern
 
-Restating, per §5 pattern, exactly what Terraform provisions at day-0:
+Restating, per §5 pattern, exactly what Terraform provisions across the tenant's lifecycle, day-0 and day-2 alike:
 
-- **VPC Segmentation (§5.1):** provisions the `SecurityProfile` + `SecurityProfileAttachment` pair from §6.3, binding the tenant's VPC to one of the five system-owned profiles.
+- **VPC Segmentation (§5.1):** provisions the `SecurityProfile` + `SecurityProfileAttachment` pair from §6.3, binding the tenant's VPC to one of the five system-owned profiles. A day-2 strategy change (e.g. moving a `dev` VPC from `none` to `vpc-isolation`) is a one-line diff to `SecurityProfileAttachment.spec.securityProfileName` in the same module, merged and applied through the same pipeline as any other change.
 - **Namespace Segmentation (§5.2):** provisions the namespace-tag `NetworkSecurityGroup` plus its two-rule isolation `FirewallPolicy` as part of the same tenant baseline, so "one namespace = one blast-radius" exists before the first workload lands.
+- **Application Ringfencing (§5.3):** provisions the app-scoped `NetworkSecurityGroup`/`FirewallPolicy` pair from §5.3 as an incremental resource added to the tenant's module whenever a new application needs ringfencing — this is exactly what §7.2 demonstrates for Acme's `cache` tier. Appendix A.5 shows an optional GitOps-based alternative for this same pattern.
 - **Day-0 Provisioned Security (§5.4):** owns both the group and the policy as part of the tenant baseline, exactly like the namespace pattern above — the only difference is the selector (`protected/env`, an explicit label) rather than the automatic namespace tag.
-- **Transit Gateway (§5.5):** `TGWSecurityConfig` is an Organization-level object, provisioned once for the Organization rather than per VPC, so it belongs in the tenant onboarding baseline alongside the Project and VPCs. A pre-merge check in the tenant GitOps pipeline should reject a `TGWFirewallPolicy` PR if the target gateway's `TGWSecurityConfig` isn't already enabled; otherwise the rules merge cleanly and silently do nothing.
-
-Application Ringfencing (§5.3) has no Terraform-owned piece — see §7.6.
+- **Transit Gateway (§5.5):** `TGWSecurityConfig` is an Organization-level object, provisioned once for the Organization rather than per VPC, so it belongs in the tenant onboarding baseline alongside the Project and VPCs. A pre-merge check in the tenant's Terraform CI pipeline should reject a `TGWFirewallPolicy` PR if the target gateway's `TGWSecurityConfig` isn't already enabled; otherwise the rules merge cleanly and silently do nothing. A later multi-VPC extension (§7.3) is simply another resource added to the same module.
 
 ---
 
-## 7. Implementing Day-2 Operations with Argo CD (GitOps)
+## 7. A Worked End-to-End Example
 
-*(core technical section #2)*
+**Scenario**: Tenant `acme` needs a `web` / `app` / `db` three-tier application with default-deny micro-segmentation and a locked-down perimeter, permitting only public HTTPS to the web tier, `web → app:8443`, and `app → db:5432`.
 
-### 7.1 Why GitOps for Continuous Security Policy
+### 7.1 Terraform Onboarding
+
+The onboarding pipeline (extending §6.3) creates the Project, VPC, Subnet, baseline `SecurityProfile`/`SecurityProfileAttachment`, and the complete tier-based security posture — tier groups, a locked-down perimeter, tier-isolation rules, and a default-deny baseline — as one module, one state, one `apply`:
+
+```hcl
+resource "kubernetes_manifest" "default_deny_east_west" {
+  manifest = {
+    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
+    kind       = "FirewallPolicy"
+    metadata = {
+      name      = "acme-default-deny"
+      namespace = "acme-prod-ns01"
+    }
+    spec = {
+      regionName = var.region_name
+      category   = "Application"
+      stateful   = true
+      rules = [
+        { name = "deny-all-in", direction = "In", action = "Drop" },
+        { name = "deny-all-out", direction = "Out", action = "Drop" }
+      ]
+    }
+  }
+}
+
+resource "kubernetes_manifest" "acme_web_tier" {
+  manifest = {
+    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
+    kind       = "NetworkSecurityGroup"
+    metadata = {
+      name      = "acme-web-tier"
+      namespace = "acme-prod-ns01"
+    }
+    spec = {
+      regionName  = var.region_name
+      vmSelectors = [{ labelSelector = { matchLabels = { tier = "web" } } }]
+    }
+  }
+}
+
+resource "kubernetes_manifest" "acme_app_tier" {
+  manifest = {
+    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
+    kind       = "NetworkSecurityGroup"
+    metadata = {
+      name      = "acme-app-tier"
+      namespace = "acme-prod-ns01"
+    }
+    spec = {
+      regionName  = var.region_name
+      vmSelectors = [{ labelSelector = { matchLabels = { tier = "app" } } }]
+    }
+  }
+}
+
+resource "kubernetes_manifest" "acme_db_tier" {
+  manifest = {
+    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
+    kind       = "NetworkSecurityGroup"
+    metadata = {
+      name      = "acme-db-tier"
+      namespace = "acme-prod-ns01"
+    }
+    spec = {
+      regionName  = var.region_name
+      vmSelectors = [{ labelSelector = { matchLabels = { tier = "db" } } }]
+    }
+  }
+}
+
+resource "kubernetes_manifest" "acme_web_tier_vpc" {
+  manifest = {
+    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
+    kind       = "VPCNetworkSecurityGroup"
+    metadata = {
+      name      = "acme-web-tier-vpc"
+      namespace = "acme-prod-ns01"
+    }
+    spec = {
+      vpcName     = "acme-prod-vpc01"
+      vmSelectors = [{ labelSelector = { matchLabels = { tier = "web" } } }]
+    }
+  }
+}
+```
+
+`acme_web_tier_vpc` mirrors `acme_web_tier` as a separate `VPCNetworkSecurityGroup` — `VPCGatewayFirewallPolicy` rules can't reference the region-scoped `NetworkSecurityGroup` kind (§3.2).
+
+```hcl
+resource "kubernetes_manifest" "acme_perimeter" {
+  manifest = {
+    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
+    kind       = "VPCGatewayFirewallPolicy"
+    metadata = {
+      name      = "acme-perimeter"
+      namespace = "acme-prod-ns01"
+    }
+    spec = {
+      regionName = var.region_name
+      vpcName    = "acme-prod-vpc01"
+      category   = "LocalGatewayRules"
+      rules = [
+        {
+          name      = "allow-inbound-https"
+          direction = "In"
+          action    = "Allow"
+          to        = [{ groupName = "acme-web-tier-vpc" }]
+          services  = [{ l4PortSet = { l4Protocol = "TCP", destinationPorts = ["443"] } }]
+        },
+        { name = "deny-all-other-inbound", direction = "In", action = "Drop" }
+      ]
+    }
+  }
+}
+
+resource "kubernetes_manifest" "acme_tier_isolation" {
+  manifest = {
+    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
+    kind       = "FirewallPolicy"
+    metadata = {
+      name      = "acme-tier-isolation"
+      namespace = "acme-prod-ns01"
+    }
+    spec = {
+      regionName = var.region_name
+      category   = "Application"
+      rules = [
+        {
+          name      = "allow-web-to-app"
+          direction = "In"
+          action    = "Allow"
+          from      = [{ groupName = "acme-web-tier" }]
+          to        = [{ groupName = "acme-app-tier" }]
+          services  = [{ l4PortSet = { l4Protocol = "TCP", destinationPorts = ["8443"] } }]
+        },
+        {
+          name      = "allow-app-to-db"
+          direction = "In"
+          action    = "Allow"
+          from      = [{ groupName = "acme-app-tier" }]
+          to        = [{ groupName = "acme-db-tier" }]
+          services  = [{ l4PortSet = { l4Protocol = "TCP", destinationPorts = ["5432"] } }]
+        }
+      ]
+    }
+  }
+}
+```
+
+Nothing here is handed off to a second tool or a separate Git path — the default-deny baseline, the tier groups, the perimeter, and the tier-isolation rules all live in the same tenant module and state from §6.4, applied atomically.
+
+### 7.2 Day-2, Tenant-Driven Change
+
+Acme's app team adds a `cache` tier. Their security engineer opens a PR against the *same Terraform config repo*, adding a new `kubernetes_manifest.acme_cache_tier` resource and a new rule block appended to `acme_tier_isolation`'s `rules` list:
+
+```hcl
+resource "kubernetes_manifest" "acme_cache_tier" {
+  manifest = {
+    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
+    kind       = "NetworkSecurityGroup"
+    metadata = {
+      name      = "acme-cache-tier"
+      namespace = "acme-prod-ns01"
+    }
+    spec = {
+      regionName  = var.region_name
+      vmSelectors = [{ labelSelector = { matchLabels = { tier = "cache" } } }]
+    }
+  }
+}
+
+# appended to kubernetes_manifest.acme_tier_isolation.manifest.spec.rules:
+#   {
+#     name      = "allow-app-to-cache"
+#     direction = "In"
+#     action    = "Allow"
+#     from      = [{ groupName = "acme-app-tier" }]
+#     to        = [{ groupName = "acme-cache-tier" }]
+#     services  = [{ l4PortSet = { l4Protocol = "TCP", destinationPorts = ["6379"] } }]
+#   }
+```
+
+Once merged and approved by the `CODEOWNERS`-designated security lead, CI runs the same `terraform plan`/`apply` pipeline from §6.1 — no separate GitOps controller, no platform-team ticket, and the default-deny `FirewallPolicy` and locked-down `VPCGatewayFirewallPolicy` still govern anything not explicitly matched. From empty namespace to a fully isolated, micro-segmented, internet-facing-only-where-intended application, the whole path took the time it took to merge a pull request and let CI apply it — not the days or weeks a ticket-driven model would have taken. (Appendix A shows this same change delivered as a GitOps-synced PR instead, for teams that have adopted that optional pattern.)
+
+### 7.3 Multi-VPC Extension
+
+If Acme later splits into a `prod` VPC and a `shared-services` VPC on a common Transit Gateway, a `TGWFirewallPolicy` (§5.5) is added to allow only the specific east-west paths needed between them, rather than relying on the coarser connectivity posture alone — just another `kubernetes_manifest` resource in the same Terraform module and state as everything else in this section.
+
+---
+
+## 8. Conclusion
+
+Multi-tenant security in VCF 9.1 works when it is designed as a set of composable, API-addressable layers — VPC-level Security Profiles, namespace isolation, application ringfencing, and Transit Gateway policy — each with a clear owner and a clear delegation boundary (§3, §5). Because every layer is a Kubernetes-native custom resource under the VCFA Consumption API (§4), the same design pattern is automatable on day one with a single tool a platform team already runs: Terraform, end-to-end, for both the atomic, reviewed day-0 baseline and every day-2 policy change that follows it (§6) — with GitOps-based continuous reconciliation available as an optional layer for teams that want it (Appendix A). §5 and §7 show that model holding up against real, live-environment scenarios — not just a diagram.
+
+**The final thought worth remembering:** by moving enforcement into the hypervisor and consuming it through the same Terraform surface as every other piece of infrastructure, security stops being a checkpoint someone has to clear and becomes an ambient property of the platform itself. VCF with vDefend doesn't just secure applications — it lets security be measured the way the rest of the business measures itself: faster time-to-market, lower operational cost, and continuous, demonstrable compliance.
+
+---
+
+## Appendix A. Continuous Day-2 Operations with Argo CD (GitOps)
+
+§6 and §7 show this paper's default model: Terraform, end-to-end, for both the day-0 baseline and every day-2 change. Some platform teams want more than periodic `apply` — an always-on reconciliation loop with continuous drift correction, self-service via a Git merge instead of a pipeline run, and native per-tenant fan-out. This appendix shows how to layer Argo CD GitOps reconciliation on top of the same CCI-exposed objects, as an optional pattern rather than this paper's default.
+
+### A.1 Why GitOps for Continuous Security Policy
 
 Security policy is not "set once at provisioning" — it changes continuously as tenant applications evolve (new microservice, new port, decommissioned tier). Treating it as a one-time Terraform apply leaves a gap for exactly the kind of manual, undocumented change that turns into an audit finding. Argo CD's continuous reconciliation loop closes that gap:
 
@@ -591,7 +790,7 @@ Security policy is not "set once at provisioning" — it changes continuously as
 - **Self-service without a pipeline run.** Tenant security engineers merge a PR against their tenant's policy repo; Argo CD picks it up within its poll/webhook interval — no separate CI job needs to hold cloud credentials.
 - **Native multi-tenant fan-out** via `ApplicationSet`, generating one Argo CD `Application` per tenant from a single template.
 
-### 7.2 Registering a Tenant's vSphere Namespace as an Argo CD Target
+### A.2 Registering a Tenant's vSphere Namespace as an Argo CD Target
 
 Each tenant's CCI kubeconfig (obtained once, out-of-band or via the same `vcfa_kubeconfig` Terraform data source used for bootstrapping in §6.2) is registered as an Argo CD cluster secret, scoped so Argo CD's service account only has RBAC (via `authorization.cci.vmware.com`) within that tenant's namespace(s) — never cluster-admin on the shared Supervisor.
 
@@ -614,7 +813,7 @@ stringData:
     }
 ```
 
-### 7.3 Per-Tenant Application via ApplicationSet
+### A.3 Per-Tenant Application via ApplicationSet
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -652,205 +851,27 @@ spec:
           - CreateNamespace=false   # namespace lifecycle stays with Terraform, not GitOps
 ```
 
-`tenants/acme/security-policy/` in Git contains plain `NetworkSecurityGroup` / `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` YAML — the shapes from §4.3 and the worked example in §8 — reviewed via standard pull request workflow, ideally with a `CODEOWNERS` entry requiring the tenant's security lead to approve changes to their own policy.
+`tenants/acme/security-policy/` in Git contains plain `NetworkSecurityGroup` / `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` YAML — the shapes from §4.3 and the worked example in §7 — reviewed via standard pull request workflow, ideally with a `CODEOWNERS` entry requiring the tenant's security lead to approve changes to their own policy.
 
-### 7.4 Ordering and Safety
+### A.4 Ordering and Safety
 
 - Use `argocd.argoproj.io/sync-wave` annotations to guarantee `NetworkSecurityGroup` objects (wave 0) and the default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy` (wave 1) land before more permissive tier-specific allow rules (wave 2+) — groups must exist before a policy can reference them, and a default-deny baseline should never trail its allow rules into the cluster.
 - Run Argo CD in **non-selfHeal, manual-sync mode for a probation period** on newly onboarded tenants, flipping to `automated.selfHeal: true` once the baseline policy has been validated in a lower environment — this gives a soft rollout path for a capability that can otherwise instantly enforce a mistake fleet-wide.
 
-### 7.5 Terraform vs. Argo CD: Choosing an Owner per Object
+### A.5 Applying Argo CD to Each Design Pattern
 
-The two tools aren't competing for the same job — they excel at opposite ends of a tenant's lifecycle.
-
-| Dimension | Terraform | Argo CD (GitOps) |
-|---|---|---|
-| Best for | Day-0 tenant/VPC provisioning, one-shot baseline | Day-2 continuous security policy management |
-| Reconciliation | On-demand (`apply`) | Continuous (default poll ~3 min, or webhook-driven) |
-| Drift handling | Detected at next `plan`; requires a pipeline run to fix | Auto-corrected (`selfHeal`) or flagged in near-real-time |
-| Ownership model | Terraform state file per tenant | Git repo path per tenant; K8s is desired-state store |
-| Credential exposure | CI runner needs tenant CCI token during `apply` | Argo CD holds long-lived scoped token; no per-change CI credential minting |
-| Tenant self-service UX | PR → pipeline run → apply (slower, gated) | PR → merge → auto-sync (faster, still gated by review) |
-| Blast-radius control | Per-tenant state + `plan` review | Per-tenant `Application`/`AppProject` RBAC + `syncPolicy` |
-
-**Recommended hybrid**: Terraform owns the tenant *shell* (Project, VPC, Subnet, quotas, RBAC bindings, initial `SecurityProfile`, and a default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy`) as part of the onboarding pipeline from §6. Once the tenant exists, hand off ongoing `NetworkSecurityGroup`, `FirewallPolicy`, `VPCGatewayFirewallPolicy`, and `TGWFirewallPolicy` lifecycle to Argo CD, pointed at a tenant-owned Git path. Never let both tools manage the *same* object — pick one owner per resource to avoid field-ownership flapping. §6.5 and §7.6 apply this split to each of §5's design patterns.
-
-### 7.6 Applying Argo CD to Each Design Pattern
-
-Restating, per §5 pattern, exactly what Argo CD reconciles at day-2:
+Restating, per §5 pattern, exactly what Argo CD reconciles at day-2, as an alternative to §6.5's Terraform-owned default:
 
 - **VPC Segmentation (§5.1):** a strategy change — e.g. moving a `dev` VPC from `none` to `vpc-isolation` — is a one-line diff to `SecurityProfileAttachment.spec.securityProfileName` in the tenant's Git path, synced automatically.
 - **Namespace Segmentation (§5.2):** any `Application`-category rule opening a specific port between namespaces is added as a normal PR against the tenant's policy repo; the `Environment`-category isolation policy still governs anything not explicitly matched.
-- **Application Ringfencing (§5.3):** because a new application being ringfenced is exactly the kind of change that happens continuously as a tenant's portfolio grows, this is squarely an Argo CD-owned change — a PR adding the app's group and policy to the tenant's Git path, reviewed by `CODEOWNERS`, synced automatically.
+- **Application Ringfencing (§5.3):** because a new application being ringfenced is exactly the kind of change that happens continuously as a tenant's portfolio grows, this is squarely a GitOps-friendly change — a PR adding the app's group and policy to the tenant's Git path, reviewed by `CODEOWNERS`, synced automatically.
 - **Transit Gateway (§5.5):** tenant-specific `TGWFirewallPolicy` rules are layered in the same way as any other tenant policy change, reviewed and synced from the tenant's Git path.
 
-Day-0 Provisioned Security (§5.4) is fully owned by Terraform at onboarding — see §6.5.
+Day-0 Provisioned Security (§5.4) is fully owned by Terraform at onboarding regardless of which day-2 model a team chooses — see §6.5.
 
 ---
 
-## 8. A Worked End-to-End Example
-
-**Scenario**: Tenant `acme` needs a `web` / `app` / `db` three-tier application with default-deny micro-segmentation and a locked-down perimeter, permitting only public HTTPS to the web tier, `web → app:8443`, and `app → db:5432`.
-
-### 8.1 Terraform Onboarding
-
-The onboarding pipeline (extending §6.3) creates the Project, VPC, Subnet, baseline `SecurityProfile`/`SecurityProfileAttachment`, tier groups, and a default-deny `FirewallPolicy`:
-
-```hcl
-resource "kubernetes_manifest" "default_deny_east_west" {
-  manifest = {
-    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
-    kind       = "FirewallPolicy"
-    metadata = {
-      name      = "acme-default-deny"
-      namespace = "acme-prod-ns01"
-    }
-    spec = {
-      regionName = var.region_name
-      category   = "Application"
-      stateful   = true
-      rules = [
-        { name = "deny-all-in", direction = "In", action = "Drop" },
-        { name = "deny-all-out", direction = "Out", action = "Drop" }
-      ]
-    }
-  }
-}
-```
-
-### 8.2 Handoff to Argo CD
-
-The pipeline opens a PR into `tenants/acme/security-policy/` in the tenant's Git repo containing the tier-specific groups and allow rules, and registers `acme`'s namespace as an `ApplicationSet` element (§7.3).
-
-`tenants/acme/security-policy/groups.yaml`:
-
-```yaml
-apiVersion: vpc.nsx.vmware.com/v1alpha1
-kind: NetworkSecurityGroup
-metadata:
-  name: acme-web-tier
-  namespace: acme-prod-ns01
-spec:
-  regionName: region-a
-  vmSelectors:
-    - labelSelector:
-        matchLabels: { tier: web }
----
-apiVersion: vpc.nsx.vmware.com/v1alpha1
-kind: NetworkSecurityGroup
-metadata:
-  name: acme-app-tier
-  namespace: acme-prod-ns01
-spec:
-  regionName: region-a
-  vmSelectors:
-    - labelSelector:
-        matchLabels: { tier: app }
----
-apiVersion: vpc.nsx.vmware.com/v1alpha1
-kind: NetworkSecurityGroup
-metadata:
-  name: acme-db-tier
-  namespace: acme-prod-ns01
-spec:
-  regionName: region-a
-  vmSelectors:
-    - labelSelector:
-        matchLabels: { tier: db }
----
-apiVersion: vpc.nsx.vmware.com/v1alpha1
-kind: VPCNetworkSecurityGroup
-metadata:
-  name: acme-web-tier-vpc
-  namespace: acme-prod-ns01
-spec:
-  vpcName: acme-prod-vpc01
-  vmSelectors:
-    - labelSelector:
-        matchLabels: { tier: web }
-```
-
-`acme-web-tier-vpc` mirrors `acme-web-tier` as a separate `VPCNetworkSecurityGroup` — `VPCGatewayFirewallPolicy` rules can't reference the region-scoped `NetworkSecurityGroup` kind (§3.2).
-
-`tenants/acme/security-policy/perimeter.yaml`:
-
-```yaml
-apiVersion: vpc.nsx.vmware.com/v1alpha1
-kind: VPCGatewayFirewallPolicy
-metadata:
-  name: acme-perimeter
-  namespace: acme-prod-ns01
-spec:
-  regionName: region-a
-  vpcName: acme-prod-vpc01
-  category: LocalGatewayRules
-  rules:
-    - name: allow-inbound-https
-      direction: In
-      action: Allow
-      to: [{ groupName: acme-web-tier-vpc }]
-      services: [{ l4PortSet: { l4Protocol: TCP, destinationPorts: ["443"] } }]
-    - name: deny-all-other-inbound
-      direction: In
-      action: Drop
-```
-
-`tenants/acme/security-policy/tier-isolation.yaml`:
-
-```yaml
-apiVersion: vpc.nsx.vmware.com/v1alpha1
-kind: FirewallPolicy
-metadata:
-  name: acme-tier-isolation
-  namespace: acme-prod-ns01
-spec:
-  regionName: region-a
-  category: Application
-  rules:
-    - name: allow-web-to-app
-      direction: In
-      action: Allow
-      from: [{ groupName: acme-web-tier }]
-      to: [{ groupName: acme-app-tier }]
-      services: [{ l4PortSet: { l4Protocol: TCP, destinationPorts: ["8443"] } }]
-    - name: allow-app-to-db
-      direction: In
-      action: Allow
-      from: [{ groupName: acme-app-tier }]
-      to: [{ groupName: acme-db-tier }]
-      services: [{ l4PortSet: { l4Protocol: TCP, destinationPorts: ["5432"] } }]
-```
-
-### 8.3 Day-2, Tenant-Driven Change
-
-Acme's app team adds a `cache` tier. Their security engineer opens a PR adding a new `NetworkSecurityGroup` (`acme-cache-tier`) and a rule to `tier-isolation.yaml`:
-
-```yaml
-    - name: allow-app-to-cache
-      direction: In
-      action: Allow
-      from: [{ groupName: acme-app-tier }]
-      to: [{ groupName: acme-cache-tier }]
-      services: [{ l4PortSet: { l4Protocol: TCP, destinationPorts: ["6379"] } }]
-```
-
-Once merged and approved by the `CODEOWNERS`-designated security lead, Argo CD syncs it — no Terraform run, no platform-team ticket, and the default-deny `FirewallPolicy` and locked-down `VPCGatewayFirewallPolicy` still govern anything not explicitly matched. From empty namespace to a fully isolated, micro-segmented, internet-facing-only-where-intended application, the whole path took the time it took to merge a couple of pull requests — not the days or weeks a ticket-driven model would have taken.
-
-### 8.4 Multi-VPC Extension
-
-If Acme later splits into a `prod` VPC and a `shared-services` VPC on a common Transit Gateway, a `TGWFirewallPolicy` (§5.5) is added to allow only the specific east-west paths needed between them, rather than relying on the coarser connectivity posture alone.
-
----
-
-## 9. Conclusion
-
-Multi-tenant security in VCF 9.1 works when it is designed as a set of composable, API-addressable layers — VPC-level Security Profiles, namespace isolation, application ringfencing, and Transit Gateway policy — each with a clear owner and a clear delegation boundary (§3, §5). Because every layer is a Kubernetes-native custom resource under the VCFA Consumption API (§4), the same design pattern is automatable on day one with exactly two tools a platform team already runs: Terraform for the atomic, reviewed day-0 baseline (§6), and Argo CD for the continuously reconciled day-2 policy lifecycle (§7). §5 and §8 show that pairing holding up against real, live-environment scenarios — not just a diagram.
-
-**The final thought worth remembering:** by moving enforcement into the hypervisor and consuming it through the same Terraform-and-GitOps surface as every other piece of infrastructure, security stops being a checkpoint someone has to clear and becomes an ambient property of the platform itself. VCF with vDefend doesn't just secure applications — it lets security be measured the way the rest of the business measures itself: faster time-to-market, lower operational cost, and continuous, demonstrable compliance.
-
----
-
-## Appendix A. Glossary
+## Appendix B. Glossary
 
 | Term | Meaning |
 |---|---|
@@ -867,7 +888,7 @@ Multi-tenant security in VCF 9.1 works when it is designed as a set of composabl
 | **Privileged (protected) label** | A VCFA label whose application and removal are RBAC-controlled, translated to an NSX tag; lets an Organization's admins key policy to a marker its application teams cannot reassign |
 | **Micro-segmentation** | Fine-grained, per-workload network isolation, independent of subnet/VLAN |
 | **GitOps** | Operating infrastructure by reconciling live state against a Git repository |
-| **Argo CD** | The GitOps controller this paper uses for day-2 policy reconciliation |
+| **Argo CD** | The GitOps controller Appendix A uses for its optional, continuous day-2 policy reconciliation pattern |
 | **ApplicationSet** | Argo CD's mechanism for generating one `Application` per tenant from a template |
 | **sync-wave** | An Argo CD annotation controlling apply order across resources in a sync |
 | **kubeconfig** | The credential/context bundle a tenant or pipeline uses to reach CCI |
@@ -876,7 +897,7 @@ Multi-tenant security in VCF 9.1 works when it is designed as a set of composabl
 
 ---
 
-## Appendix B. Additional Resources
+## Appendix C. Additional Resources
 
 - Broadcom Developer Portal — [CCI API Reference (`xapis/cci-api`, `vpc.nsx.vmware.com/v1alpha1`)](https://developer.broadcom.com/xapis/cci-api/latest/api-docs.html#k8s-api-vpc-nsx-vmware-com-v1alpha1)
 - Broadcom TechDocs — [Firewall Policies in an NSX VPC](https://techdocs.broadcom.com/us/en/vmware-cis/nsx/vmware-nsx/9-0/administration-guide/nsx-multi-tenancy/nsx-virtual-private-clouds/firewall-policies-in-an-nsx-vpc.html)
