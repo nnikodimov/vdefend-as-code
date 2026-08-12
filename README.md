@@ -392,11 +392,9 @@ spec:
   tcpStrict: true
 ```
 
-### 5.4 Day-0 Provisioned Security
+### 5.4 Zero-Trust Provisioning
 
-The pattern above (label → group → policy) generalizes into the mechanism that makes security "out-of-the-box" rather than bolted on after deployment: the protecting label is applied **at VM creation time**, as part of the VM Service spec, so the workload is a member of its security group — and therefore covered by its firewall policy — from the moment it powers on. Because the group and its lockdown policy already exist (provisioned as part of tenant/environment onboarding), there is no window between "VM boots" and "VM is protected."
-
-The tightest version of "secure by default" skips the gap between "workload exists" and "workload is grouped" entirely by assigning the protecting label *at deployment time*, not as a follow-up step:
+This pattern (label → group → policy) bakes security directly into the deployment pipeline rather than bolting it on after launch. Pairing a `NetworkSecurityGroup` selecting `protected/env: dev` with a `FirewallPolicy` provisioned *before* any workload exists ensures the workload immediately joins its respective security group and inherits its firewall policy the moment it powers on. Because these groups and policies are pre-provisioned during environment onboarding, there is zero exposure window between creation and protection.
 
 ```yaml
 apiVersion: vmoperator.vmware.com/v1alpha5
@@ -405,7 +403,6 @@ metadata:
   name: dev01-vm01
   namespace: dev01-y3fp4
   labels:
-    vm-selector: dev01-vm01
     protected/env: dev
 spec:
   className: best-effort-xsmall
@@ -413,29 +410,56 @@ spec:
   storageClass: ftt0-storage-policy
   powerState: PoweredOn
 ```
+**VCFA Blueprint Template Specification**
+The following template illustrates how a VM can be provisioned via VCFA blueprint inheriting security posture from day-0:
 
-Paired with a `NetworkSecurityGroup` selecting `protected/env: dev` and an `Environment`-category `FirewallPolicy` (jump-to-application intra-group, allow outbound, drop everything else) provisioned *before* any workload exists, the VM is born inside its governing policy — there is no window where it's powered on but unprotected, and no manual step for an app owner to remember. This is the pattern to reach for when grouping needs to cut across namespaces by role (`dev`, `staging`) rather than by tenant boundary — the only difference from §5.2's namespace pattern is the selector (`protected/env`, an explicit label) rather than the automatic namespace tag.
+```yaml
+resources:
+  CCI_Supervisor_Namespace_1:
+    type: CCI.Supervisor.Namespace
+    properties:
+      name: dev01-y3fp4
+      existing: true
+  Virtual_Machine_1:
+    type: CCI.Supervisor.Resource
+    properties:
+      context: ${resource.CCI_Supervisor_Namespace_1.id}
+      manifest:
+        apiVersion: vmoperator.vmware.com/v1alpha5
+        kind: VirtualMachine
+        metadata:
+          name: ${env.deploymentName + "-" + "-" + env.projectName}
+          labels:
+            protected/env: dev
+        spec:
+          className: best-effort-xsmall
+          imageName: vmi-9a6ad929557aca964
+          powerState: PoweredOn
+          storageClass: ftt0-storage-policy
+      wait:
+        conditions:
+          - type: VirtualMachineCreated
+            status: 'True'
+```
 
-### 5.5 Using Transit Gateway (TGW) for Tenant Security
+### 5.5 Transit Gateway (TGW) for Tenant Security
 
-For a tenant whose architecture spans multiple VPCs attached to the Organization's Transit Gateway, `TGWFirewallPolicy` gives finer control than the blunt Community/Isolated/Promiscuous-style connectivity posture set by a `VPCConnectivityProfile`. It has its own master switch: a `TGWFirewallPolicy` enforces nothing until the Transit Gateway's `TGWSecurityConfig` explicitly enables the `GatewayFirewall` feature. Both the Transit Gateway and its firewall are exposed to the tenant in VCFA, so `TGWSecurityConfig` is an Organization-level object the tenant's own admins own — provisioned once for the Organization, not per VPC.
+When a tenant architecture spans multiple VPCs attached to an Organization's Transit Gateway, consolidating north-south security controls at the transit layer offers enhanced operational flexibility. In VCFA 9.1, the vDefend TGW Firewall exposes declarative, fine-grained traffic filtering via the `TGWFirewallPolicy` and `TGWSecurityConfig` CRDs, within the `vpc.nsx.vmware.com/v1alpha1` API group. Because the Transit Gateway sits at the Organization boundary, VPC-specific policies and rules carve out exactly which paths are permitted for the Organization's inbound and outbound communication.
 
 ```yaml
 apiVersion: vpc.nsx.vmware.com/v1alpha1
 kind: TGWSecurityConfig
 metadata:
-  name: corp-shared-tgw-security-config
-  namespace: acme-prod-ns01
+  name: acme-shared-tgw-security-config
 spec:
   features:
-    - name: GatewayFirewall
-      enabled: true
+  - enabled: true
+    name: GatewayFirewall
 ---
 apiVersion: vpc.nsx.vmware.com/v1alpha1
 kind: TGWFirewallPolicy
 metadata:
   name: acme-shared-services-access
-  namespace: acme-prod-ns01
 spec:
   category: LocalGatewayRules
   regionName: region-a
@@ -448,14 +472,12 @@ spec:
     from:
     - groupName: shared-services-vpc-egress
     ipProtocol: IPV4
-    name: "allow-shared-services-to-acme"
+    name: "allow-shared-services"
     services:
-    - l4PortSet:
-        destinationPorts:
-        - "443"
-        l4Protocol: TCP
+    - networkServiceName: :DNS
+    - networkServiceName: :DNS-UDP
     to:
-    - groupName: acme-app-tier
+    - groupName: shared-services
   - action: Drop
     direction: In
     ipProtocol: IPV4
@@ -464,25 +486,11 @@ spec:
   tcpStrict: true
 ```
 
-Tenant-specific `TGWFirewallPolicy` rules carve out exactly which cross-VPC paths a multi-VPC tenant needs. Because the gateway sits at the Organization boundary, a misconfigured rule here can affect traffic across *every* VPC the Organization owns at once — a far wider blast radius than a single VPC's policy. Review authority therefore belongs with the Organization Security Admin (§3.3) rather than with an individual application team.
-
-### 5.6 Delegation Model and Guardrails-as-Code
-
-Pulling 5.1–5.5 together, the delegation boundary looks like this:
-
-| Actor | Self-service | Centrally governed |
-|---|---|---|
-| **Platform/Security team** | — | The catalog of system Security Profiles; org default strategy; namespace-isolation policy templates; Application-category priority conventions |
-| **Tenant Admin** | Select/switch a VPC's Security Profile; toggle the Gateway Firewall | Cannot invent a new VPC-level strategy outside the catalog |
-| **Application owner** | Label workloads; request an app-scoped `NetworkSecurityGroup`/`FirewallPolicy` via catalog item or Terraform module | Cannot bypass namespace isolation or the VPC-level profile |
-
-The concrete escape hatch worth calling out explicitly: **a policy created by a Security Profile cannot be edited directly.** Its rules are fixed by the profile definition. Customizing behavior means authoring a *separate*, higher-priority `FirewallPolicy` that is evaluated before the profile-owned one. This is a deliberate guardrail: it keeps the system-owned baseline tamper-evident (nobody can silently punch a hole in the profile itself) while still giving tenants and application teams a supported way to add precision on top of it.
-
 ---
 
 ## 6. Terraform for the Full Tenant Security Lifecycle
 
-Terraform fits naturally where tenant security config is provisioned **as part of** environment stand-up — a "new tenant" pipeline that creates the Project, VPC, Subnets, quotas, and the baseline `SecurityProfile`/`NetworkSecurityGroup`/default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy` set in one atomic `apply`, with the safety of `plan` review and state-tracked drift detection. Run that `apply` inside a CI job gated by the same pull-request review every other infrastructure change goes through, and the whole tenant shell — including its day-0 security posture — becomes a reviewed, reproducible artifact instead of a runbook someone follows by hand. For platform teams that already run multi-cloud IaC on Terraform, this means zero new tooling to onboard a tenant securely on day one — and the same module, the same `plan`/`apply` gate, and the same pull-request review keep governing every day-2 change made to that tenant's security posture afterward (§6.4, §6.5, §7). There is no second tool to introduce once the tenant exists; Appendix A covers an optional GitOps-based alternative for teams that want continuous, always-on reconciliation on top of this.
+Terraform fits naturally where tenant security config is provisioned **as part of** environment stand-up — a "new tenant" pipeline that creates the Project, VPC, Subnets, quotas, and the baseline `SecurityProfile`/`NetworkSecurityGroup`/default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy` set in one atomic `apply`, with the safety of `plan` review and state-tracked drift detection. Run that `apply` inside a CI job gated by the same pull-request review every other infrastructure change goes through, and the whole tenant shell — including its day-0 security posture — becomes a reviewed, reproducible artifact instead of a runbook someone follows by hand. For platform teams that already run multi-cloud IaC on Terraform, this means zero new tooling to onboard a tenant securely on day one — and the same module, the same `plan`/`apply` gate, and the same pull-request review keep governing every day-2 change made to that tenant's security posture afterward (§6.3, §7). There is no second tool to introduce once the tenant exists; Appendix A covers an optional GitOps-based alternative for teams that want continuous, always-on reconciliation on top of this.
 
 ### 6.1 Provider Chain
 
@@ -601,17 +609,7 @@ This is illustrative of the pattern — provision the profile, bind it to a VPC,
 
 - **One Terraform workspace/state per tenant Project**, keyed by tenant ID — never a single monolithic state file spanning tenants. This bounds blast radius: a bad `apply` for one tenant can't corrupt another's state, and it lets pipelines run in parallel.
 - Wrap the resources above in a `tenant-vdefend-baseline` module with variables for tier labels, allowed ports, and default-deny posture, versioned in a shared module registry so every tenant onboarding starts from the same vetted security baseline.
-- Terraform remains the sole owner of every object in this baseline across the tenant's whole lifecycle — day-0 provisioning and every day-2 change alike (§6.5, §7) — rather than handing steady-state reconciliation off to a second tool. Appendix A shows an optional alternative for platform teams that want an always-on, continuous reconciliation loop beyond periodic `apply`.
-
-### 6.4 Applying Terraform to Each Design Pattern
-
-Restating, per §5 pattern, exactly what Terraform provisions across the tenant's lifecycle, day-0 and day-2 alike:
-
-- **VPC Segmentation (§5.1):** provisions the `SecurityProfile` + `SecurityProfileAttachment` pair from §6.3, binding the tenant's VPC to one of the five system-owned profiles. A day-2 strategy change (e.g. moving a `dev` VPC from `none` to `vpc-isolation`) is a one-line diff to `SecurityProfileAttachment.spec.securityProfileName` in the same module, merged and applied through the same pipeline as any other change.
-- **Namespace Segmentation (§5.2):** provisions the namespace-tag `NetworkSecurityGroup` plus its two-rule isolation `FirewallPolicy` as part of the same tenant baseline, so "one namespace = one blast-radius" exists before the first workload lands.
-- **Application Ringfencing (§5.3):** provisions the app-scoped `NetworkSecurityGroup`/`FirewallPolicy` pair from §5.3 as an incremental resource added to the tenant's module whenever a new application needs ringfencing — this is exactly what §7.2 demonstrates for Acme's `cache` tier. Appendix A.5 shows an optional GitOps-based alternative for this same pattern.
-- **Day-0 Provisioned Security (§5.4):** owns both the group and the policy as part of the tenant baseline, exactly like the namespace pattern above — the only difference is the selector (`protected/env`, an explicit label) rather than the automatic namespace tag.
-- **Transit Gateway (§5.5):** `TGWSecurityConfig` is an Organization-level object, provisioned once for the Organization rather than per VPC, so it belongs in the tenant onboarding baseline alongside the Project and VPCs. A pre-merge check in the tenant's Terraform CI pipeline should reject a `TGWFirewallPolicy` PR if the target gateway's `TGWSecurityConfig` isn't already enabled; otherwise the rules merge cleanly and silently do nothing. A later multi-VPC extension (§7.3) is simply another resource added to the same module.
+- Terraform remains the sole owner of every object in this baseline across the tenant's whole lifecycle — day-0 provisioning and every day-2 change alike (§7) — rather than handing steady-state reconciliation off to a second tool. Appendix A shows an optional alternative for platform teams that want an always-on, continuous reconciliation loop beyond periodic `apply`.
 
 ---
 
@@ -768,7 +766,7 @@ resource "kubernetes_manifest" "acme_tier_isolation" {
 }
 ```
 
-Nothing here is handed off to a second tool or a separate Git path — the default-deny baseline, the tier groups, the perimeter, and the tier-isolation rules all live in the same tenant module and state from §6.4, applied atomically.
+Nothing here is handed off to a second tool or a separate Git path — the default-deny baseline, the tier groups, the perimeter, and the tier-isolation rules all live in the same tenant module and state from §6.2, applied atomically.
 
 ### 7.2 Day-2, Tenant-Driven Change
 
@@ -899,14 +897,14 @@ spec:
 
 ### A.5 Applying Argo CD to Each Design Pattern
 
-Restating, per §5 pattern, exactly what Argo CD reconciles at day-2, as an alternative to §6.5's Terraform-owned default:
+Restating, per §5 pattern, exactly what Argo CD reconciles at day-2, as an alternative to this paper's Terraform-owned default (§6, §7):
 
 - **VPC Segmentation (§5.1):** a strategy change — e.g. moving a `dev` VPC from `none` to `vpc-isolation` — is a one-line diff to `SecurityProfileAttachment.spec.securityProfileName` in the tenant's Git path, synced automatically.
 - **Namespace Segmentation (§5.2):** any `Application`-category rule opening a specific port between namespaces is added as a normal PR against the tenant's policy repo; the `Environment`-category isolation policy still governs anything not explicitly matched.
 - **Application Ringfencing (§5.3):** because a new application being ringfenced is exactly the kind of change that happens continuously as a tenant's portfolio grows, this is squarely a GitOps-friendly change — a PR adding the app's group and policy to the tenant's Git path, reviewed by `CODEOWNERS`, synced automatically.
 - **Transit Gateway (§5.5):** tenant-specific `TGWFirewallPolicy` rules are layered in the same way as any other tenant policy change, reviewed and synced from the tenant's Git path.
 
-Day-0 Provisioned Security (§5.4) is fully owned by Terraform at onboarding regardless of which day-2 model a team chooses — see §6.5.
+Day-0 Provisioned Security (§5.4) is fully owned by Terraform at onboarding regardless of which day-2 model a team chooses — see §6.3.
 
 ---
 
