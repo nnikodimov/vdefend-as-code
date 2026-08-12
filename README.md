@@ -262,26 +262,35 @@ kind: FirewallPolicy
 metadata:
   name: namespace-isolation-prod01
 spec:
-  regionName: m01-reg01
+  appliedTo:
+    groupNames:
+    - prod01-namespace
   category: Environment
   priority: 10001
-  appliedTo:
-    groupNames: [prod01-namespace]
+  regionName: m01-reg01
+  rules:
+  - action: JumpToApplication
+    direction: InOut
+    from:
+    - groupName: prod01-namespace
+    ipProtocol: IPV4
+    name: "rule-01"
+    services:
+    - networkServiceName: Any
+    to:
+    - groupName: prod01-namespace
+  - action: Drop
+    direction: InOut
+    from:
+    - groupName: Any
+    ipProtocol: IPV4
+    name: "rule-02"
+    services:
+    - networkServiceName: Any
+    to:
+    - groupName: Any
   stateful: true
   tcpStrict: true
-  rules:
-    - name: rule-01
-      direction: InOut
-      action: JumpToApplication
-      from: [{ groupName: prod01-namespace }]
-      to: [{ groupName: prod01-namespace }]
-      services: [{ networkServiceName: Any }]
-    - name: rule-02
-      direction: InOut
-      action: Drop
-      from: [{ groupName: Any }]
-      to: [{ groupName: Any }]
-      services: [{ networkServiceName: Any }]
 ```
 
 **Note:** A primary operational complexity in Shared VPC topologies arises from handling non-deterministic IP services, such as Load Balancer Virtual Servers and Source Network Address Translation (SNAT) endpoints. By default, NSX assigns Load Balancer services and outbound SNAT IPs dynamically from the Project's shared External IP block. Because these ingress and egress IP addresses are allocated dynamically, dynamic segment port matching must be paired with explicit "IP Addresses Only" groups to account for Virtual IP (VIP) targets in cross-namespace firewall policies.
@@ -331,35 +340,56 @@ kind: FirewallPolicy
 metadata:
   name: app01-ringfencing
 spec:
-  regionName: m01-reg01
+  appliedTo:
+    groupNames:
+    - app01
   category: Application
   priority: 10002
-  appliedTo:
-    groupNames: [app01]
+  regionName: m01-reg01
   rules:
-    - name: allow-app01-intra
-      direction: InOut
-      action: Allow
-      from: [{ groupName: app01 }]
-      to: [{ groupName: app01 }]
-      services: [{ networkServiceName: Any }]
-    - name: allow-https-inbound
-      direction: In
-      action: Allow
-      from: [{ groupName: Any }]
-      to: [{ groupName: app01 }]
-      services: [{ networkServiceName: HTTPS }]
-    - name: allow-dns-outbound
-      direction: Out
-      action: Allow
-      from: [{ groupName: app01 }]
-      to: [{ groupName: Any }]
-      services: [{ networkServiceName: DNS }, { networkServiceName: DNS-UDP }]
-    - name: app01-lockdown
-      direction: InOut
-      action: Drop
-      from: [{ groupName: Any }]
-      to: [{ groupName: Any }]
+  - action: Allow
+    direction: InOut
+    from:
+    - groupName: app01
+    ipProtocol: IPV4
+    name: "allow-app01-intra"
+    services:
+    - networkServiceName: Any
+    to:
+    - groupName: app01
+  - action: Allow
+    direction: In
+    from:
+    - groupName: Any
+    ipProtocol: IPV4
+    name: "allow-https-inbound"
+    services:
+    - networkServiceName: :HTTPS
+    to:
+    - groupName: app01
+  - action: Allow
+    direction: Out
+    from:
+    - groupName: app01
+    ipProtocol: IPV4
+    name: "allow-dns-outbound"
+    services:
+    - networkServiceName: :DNS
+    - networkServiceName: :DNS-UDP
+    to:
+    - groupName: Any
+  - action: Drop
+    direction: InOut
+    from:
+    - groupName: Any
+    ipProtocol: IPV4
+    name: "app01-lockdown"
+    services:
+    - networkServiceName: Any
+    to:
+    - groupName: Any
+  stateful: true
+  tcpStrict: true
 ```
 
 ### 5.4 Day-0 Provisioned Security
@@ -407,20 +437,31 @@ metadata:
   name: acme-shared-services-access
   namespace: acme-prod-ns01
 spec:
+  category: LocalGatewayRules
   regionName: region-a
-  category: Default
   rules:
-    - name: allow-shared-services-to-acme
-      direction: In
-      action: Allow
-      appliedTo:
-        gatewayAttachmentNames: [acme-prod-tgw-attachment]
-      from: [{ groupName: shared-services-vpc-egress }]
-      to: [{ groupName: acme-app-tier }]
-      services: [{ l4PortSet: { l4Protocol: TCP, destinationPorts: ["443"] } }]
-    - name: deny-other-vpcs
-      direction: In
-      action: Drop
+  - action: Allow
+    appliedTo:
+      gatewayNames:
+      - acme-prod-tgw
+    direction: In
+    from:
+    - groupName: shared-services-vpc-egress
+    ipProtocol: IPV4
+    name: "allow-shared-services-to-acme"
+    services:
+    - l4PortSet:
+        destinationPorts:
+        - "443"
+        l4Protocol: TCP
+    to:
+    - groupName: acme-app-tier
+  - action: Drop
+    direction: In
+    ipProtocol: IPV4
+    name: "deny-other-vpcs"
+  stateful: true
+  tcpStrict: true
 ```
 
 Tenant-specific `TGWFirewallPolicy` rules carve out exactly which cross-VPC paths a multi-VPC tenant needs. Because the gateway sits at the Organization boundary, a misconfigured rule here can affect traffic across *every* VPC the Organization owns at once — a far wider blast radius than a single VPC's policy. Review authority therefore belongs with the Organization Security Admin (§3.3) rather than with an individual application team.
@@ -439,13 +480,11 @@ The concrete escape hatch worth calling out explicitly: **a policy created by a 
 
 ---
 
-## 6. Implementing Security with Terraform
-
-### 6.1 Why Terraform for the Full Tenant Security Lifecycle
+## 6. Terraform for the Full Tenant Security Lifecycle
 
 Terraform fits naturally where tenant security config is provisioned **as part of** environment stand-up — a "new tenant" pipeline that creates the Project, VPC, Subnets, quotas, and the baseline `SecurityProfile`/`NetworkSecurityGroup`/default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy` set in one atomic `apply`, with the safety of `plan` review and state-tracked drift detection. Run that `apply` inside a CI job gated by the same pull-request review every other infrastructure change goes through, and the whole tenant shell — including its day-0 security posture — becomes a reviewed, reproducible artifact instead of a runbook someone follows by hand. For platform teams that already run multi-cloud IaC on Terraform, this means zero new tooling to onboard a tenant securely on day one — and the same module, the same `plan`/`apply` gate, and the same pull-request review keep governing every day-2 change made to that tenant's security posture afterward (§6.4, §6.5, §7). There is no second tool to introduce once the tenant exists; Appendix A covers an optional GitOps-based alternative for teams that want continuous, always-on reconciliation on top of this.
 
-### 6.2 Provider Chain
+### 6.1 Provider Chain
 
 VCFA 9 exposes complementary Terraform providers. For vDefend automation, two matter:
 
@@ -484,7 +523,7 @@ provider "kubernetes" {
 }
 ```
 
-### 6.3 Declaring the Tenant Security Baseline
+### 6.2 Declaring the Tenant Security Baseline
 
 ```hcl
 # security_baseline.tf
@@ -558,13 +597,13 @@ resource "kubernetes_manifest" "default_deny_gateway" {
 
 This is illustrative of the pattern — provision the profile, bind it to a VPC, and lay down a default-deny baseline — rather than a complete, ready-to-apply module. Treat resource and attribute names as subject to the provider's current schema.
 
-### 6.4 Module Design and State Strategy for Multi-Tenant Scale
+### 6.3 Module Design and State Strategy for Multi-Tenant Scale
 
 - **One Terraform workspace/state per tenant Project**, keyed by tenant ID — never a single monolithic state file spanning tenants. This bounds blast radius: a bad `apply` for one tenant can't corrupt another's state, and it lets pipelines run in parallel.
 - Wrap the resources above in a `tenant-vdefend-baseline` module with variables for tier labels, allowed ports, and default-deny posture, versioned in a shared module registry so every tenant onboarding starts from the same vetted security baseline.
 - Terraform remains the sole owner of every object in this baseline across the tenant's whole lifecycle — day-0 provisioning and every day-2 change alike (§6.5, §7) — rather than handing steady-state reconciliation off to a second tool. Appendix A shows an optional alternative for platform teams that want an always-on, continuous reconciliation loop beyond periodic `apply`.
 
-### 6.5 Applying Terraform to Each Design Pattern
+### 6.4 Applying Terraform to Each Design Pattern
 
 Restating, per §5 pattern, exactly what Terraform provisions across the tenant's lifecycle, day-0 and day-2 alike:
 
