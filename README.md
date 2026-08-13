@@ -488,9 +488,11 @@ spec:
 
 ---
 
-## 6. Terraform for the Full Tenant Security Lifecycle
+## 6. Terraform Model for Tenant Security Lifecycle
 
-Terraform fits naturally where tenant security config is provisioned **as part of** environment stand-up — a "new tenant" pipeline that creates the Project, VPC, Subnets, quotas, and the baseline `SecurityProfile`/`NetworkSecurityGroup`/default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy` set in one atomic `apply`, with the safety of `plan` review and state-tracked drift detection. Run that `apply` inside a CI job gated by the same pull-request review every other infrastructure change goes through, and the whole tenant shell — including its day-0 security posture — becomes a reviewed, reproducible artifact instead of a runbook someone follows by hand. For platform teams that already run multi-cloud IaC on Terraform, this means zero new tooling to onboard a tenant securely on day one — and the same module, the same `plan`/`apply` gate, and the same pull-request review keep governing every day-2 change made to that tenant's security posture afterward (§6.3, §7). There is no second tool to introduce once the tenant exists; Appendix A covers an optional GitOps-based alternative for teams that want continuous, always-on reconciliation on top of this.
+Terraform fits naturally into modern cloud infrastructure architectures where tenant security configurations are provisioned as an integral component of automated environment stand-up pipelines. VCFA exposes a complementary multi-provider ecosystem designed to handle the structural separation between provider-level administration and tenant-level resource management. For security and network automation within VCF, two primary providers operate in tandem:
+- **vcfa (vmware/vcfa):** Manages provider-admin-level operations across the system domain. This includes the creation and governance of Organizations, Identity Provider configurations, Regional Quotas, Organization Networking, and Regional Networking mappings. Critically, the vcfa provider exposes the vcfa_kubeconfig data source, which dynamically mints short-lived authentication credentials for the All-Apps Organization API surface (Supervisor CCI).
+- **kubernetes (hashicorp/kubernetes):** Represents HashiCorp's standard Kubernetes provider, which applies declarative manifests (kubernetes_manifest) directly against the Supervisor CCI. In VCF 9, every tenant network and security construct is exposed as a Kubernetes CRD under the vpc.nsx.vmware.com/v1alpha1 API group, enabling native management of Projects, VPCs, Subnets, Security Profiles, and Firewall Policies via standard Kubernetes manifests.
 
 ### 6.1 Provider Chain
 
