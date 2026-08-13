@@ -496,13 +496,6 @@ Terraform fits naturally into modern cloud infrastructure architectures where te
 
 ### 6.1 Provider Chain
 
-VCFA 9 exposes complementary Terraform providers. For vDefend automation, two matter:
-
-- **`vcfa`** — provider-admin-level operations (orgs, regions, quotas) and, critically, a `vcfa_kubeconfig` data source that mints CCI credentials.
-- **`kubernetes`** (HashiCorp's standard provider) — applies raw manifests (`kubernetes_manifest`) against the CCI API server for anything CCI exposes as a CRD, including every `vpc.nsx.vmware.com/v1alpha1` object.
-
-**A note for readers who already know the classic `vmware/nsxt` Terraform provider:** that provider talks to NSX Manager's Policy API directly (`nsxt_policy_security_policy`, `nsxt_policy_group`, and friends) and is the right tool for the older, non-VPC NSX-T Policy Manager model. VCF 9's VPC/CCI model is a different, Kubernetes-native surface — for it, the standard `kubernetes` provider against CCI, shown below, is the verified, correct path, not `vmware/nsxt`.
-
 ```hcl
 # providers.tf
 terraform {
