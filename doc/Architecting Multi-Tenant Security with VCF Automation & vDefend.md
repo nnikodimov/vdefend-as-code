@@ -545,8 +545,8 @@ resource "kubernetes_manifest" "prod01_namespace_group" {
       name = "prod01-namespace"
     }
     spec = {
-      regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { "nsx-op/vm_namespace" = var.vsphere_namespace } } }]
+      regionName  = "m01-reg01"
+      vmSelectors = [{ labelSelector = { matchLabels = { "nsx-op/vm_namespace" = "prod01-8sg7f" } } }]
     }
   }
 }
@@ -562,7 +562,7 @@ resource "kubernetes_manifest" "namespace_isolation_prod01" {
       appliedTo  = { groupNames = [kubernetes_manifest.prod01_namespace_group.manifest.metadata.name] }
       category   = "Environment"
       priority   = 10001
-      regionName = var.region_name
+      regionName = "m01-reg01"
       stateful   = true
       tcpStrict  = true
       rules = [
@@ -598,7 +598,7 @@ resource "kubernetes_manifest" "namespace_isolation_prod01" {
 }
 ```
 
-This is the Terraform-managed form of the `NetworkSecurityGroup`/`FirewallPolicy` pair from §5.2: `prod01_namespace_group` creates the namespace-tag group, parameterized by `var.region_name` and `var.vsphere_namespace` rather than hardcoded literals. `namespace_isolation_prod01`'s `appliedTo` references the group's own resource attribute (`kubernetes_manifest.prod01_namespace_group.manifest.metadata.name`) instead of retyping its name as a string, which is what avoids the exact "dependent objects... does not exist" failure a mismatched `groupNames` reference produces. Its rules' `from`/`to` fields still reference the group by the literal string `"prod01-namespace"`, though — since Terraform can only infer creation order from an actual attribute reference, the explicit `depends_on` is what guarantees the group exists before the policy that references it by name is submitted. Treat resource and attribute names as subject to the provider's current schema.
+This is the Terraform-managed form of the `NetworkSecurityGroup`/`FirewallPolicy` pair from §5.2. `namespace_isolation_prod01`'s `appliedTo` references the group's own resource attribute (`kubernetes_manifest.prod01_namespace_group.manifest.metadata.name`) instead of retyping its name as a string, which is what avoids the exact "dependent objects... does not exist" failure a mismatched `groupNames` reference produces. Its rules' `from`/`to` fields still reference the group by the literal string `"prod01-namespace"`, though — since Terraform can only infer creation order from an actual attribute reference, the explicit `depends_on` is what guarantees the group exists before the policy that references it by name is submitted. Treat resource and attribute names as subject to the provider's current schema.
 
 ---
 
