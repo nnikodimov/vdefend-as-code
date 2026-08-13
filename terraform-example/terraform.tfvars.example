@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and fill in real values. Do not commit terraform.tfvars.
+
+vcfa_url            = "vcfa.example.com"
+vcfa_insecure        = false
+vcfa_refresh_token   = "CHANGE-ME"
+tenant_org           = "tf-example-org"
+
+tenant_name          = "tf-example-tenant"
+tenant_namespace     = "tf-example-supervisor-ns"
+tenant_vpc_name      = "tf-example-vpc"
+region_name          = "tf-example-region"
