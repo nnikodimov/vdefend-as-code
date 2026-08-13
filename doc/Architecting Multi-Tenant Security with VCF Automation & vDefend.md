@@ -95,7 +95,7 @@ In VCFA, multi-tenancy is enforced directly by the Cloud Consumption Interface (
 
 Three integrated mechanisms establish and maintain strict isolation between tenant environments:
 
-- **Project and Namespace Boundaries:** Every infrastructure resource provisioned by a tenant resides within a designated vSphere Namespace linked to a VCFA Project (project.cci.vmware.com). Because security policies, network micro-segmentation rules, and resource groups evaluate targets using localized names and key-value label selectors, the tenancy boundary maps directly to native Kubernetes namespace boundaries.
+- **Project and Namespace Boundaries:** Every workload a tenant provisions (VMs, VKS clusters) resides within a designated vSphere Namespace linked to a VCFA Project (project.cci.vmware.com), and namespace-scoped RBAC governs those workloads directly. The security kinds themselves (`FirewallPolicy`, `NetworkSecurityGroup`, `SecurityProfile`, and the rest of §4.3's table) are cluster-scoped, not namespace-scoped — vanilla namespace-scoped `Role`/`RoleBinding`s cannot govern access to a cluster-scoped kind at all, so their tenancy boundary is enforced by CCI's own aggregation-layer authorization (§4.1) rather than by native namespace RBAC. **Unverified:** the exact mechanism CCI uses to confine a tenant's access to only their own cluster-scoped security objects isn't confirmed in this paper — verify it directly (e.g. via the CCI API server's authorization logs or a live cross-tenant access test) before relying on namespace RBAC alone as the isolation guarantee for these kinds.
 - **RBAC:** A tenant's authentication context, established via OIDC identity federation and managed through the VCF CLI, is bound strictly to ProjectRoleBinding custom resources (authorization.cci.vmware.com) within their project namespace. The CCI API server evaluates presented JWT tokens during the API admission phase and rejects any request targeting a namespace to which the token lacks explicit authorization bindings.
 - **Resource Quotas and Namespace Classes:** Within their assigned namespace, tenants are subject to non-negotiable compute, memory, storage, and object limits established by provider administrators during Project setup. Defined via SupervisorNamespaceClassConfig specifications (spec.limits) and VCFA Resource Quota Policies, these resource ceilings are enforced at API admission, rendering unauthorized capacity expansion impossible from within the self-service layer.
 
@@ -148,6 +148,8 @@ Each capability from §3.2 is addressed through one or two custom resource kinds
 | Group | `NetworkSecurityGroup` (Region-scoped) / `VPCNetworkSecurityGroup` (VPC-scoped) | Gateway rules reference the VPC-scoped kind; DFW and TGW rules the Region-scoped one |
 | Service | `NetworkService` | Referenced by name from any rule's service list |
 | Label (Protected) | *(no kind of its own)* | An attribute on the workload object; groups select on it |
+
+**All of these kinds are cluster-scoped, not namespace-scoped** — none of them carry a `metadata.namespace`, and setting one is rejected by the API server. The "Region-scoped"/"VPC-scoped" language above describes *functional* scope, not Kubernetes API scope: a `FirewallPolicy`, `SecurityProfile`, `SecurityProfileAttachment`, `NetworkSecurityGroup`, and `VPCGatewayFirewallPolicy` all associate with a specific Region, VPC, or tenant purely through spec-level fields (`regionName`, `vpcName`) and, for Groups, through selector criteria (`vmSelectors[].namespaceSelector` alongside a `labelSelector`) — never through where the object itself lives. Every example in §5 and §7 reflects this: a `NetworkSecurityGroup`'s `labelSelector` alone matches same-labeled workloads across *every* tenant sharing the cluster; pairing it with a `namespaceSelector` (or the automatic `nsx-op/vm_namespace` tag, §5.2) is what actually confines it to one tenant.
 
 ### 4.4 A Note on Source Grounding
 
@@ -233,7 +235,7 @@ Platform teams have the operational flexibility to evaluate and assign VPC bound
 In the Dedicated VPC model, the namespace boundary and the network VPC boundary are structurally identical, providing isolated perimeter security via the VPC's Security Profile. In the Shared VPC model, multiple namespaces inhabit a single VPC, allowing applications to pool quota and share transit configurations while relying on micro-segmentation for east-west isolation. The decision to deploy either model hinges on a fundamental trade-off between strict perimeter isolation and resource efficiency.
 
 - **Dedicated VPC** — the blueprint establishes a strict one-to-one mapping between a vSphere Namespace and a VPC. vDefend Security Profiles (§5.1) attached directly to the VPC can govern ingress and egress traffic crossing the VPC boundary, serving as the explicit security posture for the contained namespace. Because no other application namespaces reside within the same VPC address space, east-west network isolation between namespaces is guaranteed by the vDefend Security Strategy chosen.
-- **Shared VPC** — the Shared VPC blueprint enables multiple vSphere Namespaces to occupy a single VPC address space, sharing a common VPC Gateway. This pattern is commonly deployed for application ecosystems that belong to a single administrative trust boundary (such as related production namespaces `prod01` and `prod02`). Consolidating namespaces into a shared VPC optimizes IP address space allocation, simplifies overall network routing, and allows for pooled network resource quotas. The traffic moving between subnets inside the same VPC is natively routed across distributed switches without traversing the VPC Gateway firewall. All Security Profiles have a default strategy to conditionally allow (**Jump to Application**) intra-VPC traffic, relying on more-granular DFW application category policies when such segmentation is required. To prevent unrestricted lateral movement between VPC co-located namespaces, platform teams must therefore deploy namespace-scoped Distributed Firewall (DFW) policies.
+- **Shared VPC** — the Shared VPC blueprint enables multiple vSphere Namespaces to occupy a single VPC address space, sharing a common VPC Gateway. This pattern is commonly deployed for application ecosystems that belong to a single administrative trust boundary (such as related production namespaces `prod01` and `prod02`). Consolidating namespaces into a shared VPC optimizes IP address space allocation, simplifies overall network routing, and allows for pooled network resource quotas. The traffic moving between subnets inside the same VPC is natively routed across distributed switches without traversing the VPC Gateway firewall. All Security Profiles have a default strategy to conditionally allow (**Jump to Application**) intra-VPC traffic, relying on more-granular DFW application category policies when such segmentation is required. To prevent unrestricted lateral movement between VPC co-located namespaces, platform teams must therefore deploy a Distributed Firewall (DFW) `FirewallPolicy` explicitly scoped, via `appliedTo` and each Group's `namespaceSelector`, to one namespace's own workloads (§4.3).
 
 To bypass the operational burden of manually tracking IP address allocations when provisioning workloads, the Supervisor incorporates an automated infrastructure metadata tagging mechanism. When virtual machines, container hosts, or network interfaces are provisioned within a vSphere Namespace, the Supervisor automatically attaches standardized key-value tags to the underlying network constructs. In VCF Networking with VPC stack deployments, the Supervisor automatically applies the tag `nsx-op/vm_namespace` set to the namespace's name on every VPC subnet segment port created within that namespace. In deployments utilizing NSX Classic mode or legacy segment models, the system tags the NSX Segment directly using the scope `kubernetes.io/metadata.name`.
 
@@ -525,6 +527,7 @@ provider "kubernetes" {
   insecure = data.vcfa_kubeconfig.tenant.insecure_skip_tls_verify
 }
 ```
+The authentication workflow relies on dynamic credential chaining across provider boundaries. The root vcfa provider authenticates using a high-privilege refresh token or API token to establish administrative organization boundaries. Once the organization exists, the `vcfa_kubeconfig` data source queries VCFA to retrieve temporary API bearer tokens, cluster endpoint URLs, and TLS verification flags. These values are dynamically passed into the kubernetes provider block, enabling immediate, authenticated provisioning of `vpc.nsx.vmware.com/v1alpha1` CRDs without storing static credentials or cluster certificates in state files or repository secrets.
 
 ### 6.2 Declaring the Tenant Security Baseline
 
@@ -536,7 +539,6 @@ resource "kubernetes_manifest" "security_profile" {
     kind       = "SecurityProfile"
     metadata = {
       name      = "${var.tenant_name}-security-profile"
-      namespace = var.tenant_namespace
     }
     spec = {
       regionName         = var.region_name
@@ -553,7 +555,6 @@ resource "kubernetes_manifest" "security_profile_attachment" {
     kind       = "SecurityProfileAttachment"
     metadata = {
       name      = "${var.tenant_name}-security-profile-attachment"
-      namespace = var.tenant_namespace
     }
     spec = {
       regionName          = var.region_name
@@ -569,11 +570,13 @@ resource "kubernetes_manifest" "app_tier_group" {
     kind       = "NetworkSecurityGroup"
     metadata = {
       name      = "${var.tenant_name}-app-tier"
-      namespace = var.tenant_namespace
     }
     spec = {
-      regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "app" } } }]
+      regionName = var.region_name
+      vmSelectors = [{
+        labelSelector     = { matchLabels = { tier = "app" } }
+        namespaceSelector = { matchLabels = { "kubernetes.io/metadata.name" = var.tenant_namespace } }
+      }]
     }
   }
 }
@@ -584,7 +587,6 @@ resource "kubernetes_manifest" "default_deny_gateway" {
     kind       = "VPCGatewayFirewallPolicy"
     metadata = {
       name      = "${var.tenant_name}-perimeter-default-deny"
-      namespace = var.tenant_namespace
     }
     spec = {
       regionName = var.region_name
@@ -617,18 +619,32 @@ This is illustrative of the pattern — provision the profile, bind it to a VPC,
 The onboarding pipeline (extending §6.3) creates the Project, VPC, Subnet, baseline `SecurityProfile`/`SecurityProfileAttachment`, and the complete tier-based security posture — tier groups, a locked-down perimeter, tier-isolation rules, and a default-deny baseline — as one module, one state, one `apply`:
 
 ```hcl
+resource "kubernetes_manifest" "acme_namespace_group" {
+  manifest = {
+    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
+    kind       = "NetworkSecurityGroup"
+    metadata = {
+      name = "acme-namespace"
+    }
+    spec = {
+      regionName  = var.region_name
+      vmSelectors = [{ labelSelector = { matchLabels = { "nsx-op/vm_namespace" = "acme-prod-ns01" } } }]
+    }
+  }
+}
+
 resource "kubernetes_manifest" "default_deny_east_west" {
   manifest = {
     apiVersion = "vpc.nsx.vmware.com/v1alpha1"
     kind       = "FirewallPolicy"
     metadata = {
       name      = "acme-default-deny"
-      namespace = "acme-prod-ns01"
     }
     spec = {
       regionName = var.region_name
       category   = "Application"
       stateful   = true
+      appliedTo  = { groupNames = ["acme-namespace"] }
       rules = [
         { name = "deny-all-in", direction = "In", action = "Drop" },
         { name = "deny-all-out", direction = "Out", action = "Drop" }
@@ -643,11 +659,13 @@ resource "kubernetes_manifest" "acme_web_tier" {
     kind       = "NetworkSecurityGroup"
     metadata = {
       name      = "acme-web-tier"
-      namespace = "acme-prod-ns01"
     }
     spec = {
-      regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "web" } } }]
+      regionName = var.region_name
+      vmSelectors = [{
+        labelSelector     = { matchLabels = { tier = "web" } }
+        namespaceSelector = { matchLabels = { "kubernetes.io/metadata.name" = "acme-prod-ns01" } }
+      }]
     }
   }
 }
@@ -658,11 +676,13 @@ resource "kubernetes_manifest" "acme_app_tier" {
     kind       = "NetworkSecurityGroup"
     metadata = {
       name      = "acme-app-tier"
-      namespace = "acme-prod-ns01"
     }
     spec = {
-      regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "app" } } }]
+      regionName = var.region_name
+      vmSelectors = [{
+        labelSelector     = { matchLabels = { tier = "app" } }
+        namespaceSelector = { matchLabels = { "kubernetes.io/metadata.name" = "acme-prod-ns01" } }
+      }]
     }
   }
 }
@@ -673,11 +693,13 @@ resource "kubernetes_manifest" "acme_db_tier" {
     kind       = "NetworkSecurityGroup"
     metadata = {
       name      = "acme-db-tier"
-      namespace = "acme-prod-ns01"
     }
     spec = {
-      regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "db" } } }]
+      regionName = var.region_name
+      vmSelectors = [{
+        labelSelector     = { matchLabels = { tier = "db" } }
+        namespaceSelector = { matchLabels = { "kubernetes.io/metadata.name" = "acme-prod-ns01" } }
+      }]
     }
   }
 }
@@ -688,11 +710,13 @@ resource "kubernetes_manifest" "acme_web_tier_vpc" {
     kind       = "VPCNetworkSecurityGroup"
     metadata = {
       name      = "acme-web-tier-vpc"
-      namespace = "acme-prod-ns01"
     }
     spec = {
-      vpcName     = "acme-prod-vpc01"
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "web" } } }]
+      vpcName = "acme-prod-vpc01"
+      vmSelectors = [{
+        labelSelector     = { matchLabels = { tier = "web" } }
+        namespaceSelector = { matchLabels = { "kubernetes.io/metadata.name" = "acme-prod-ns01" } }
+      }]
     }
   }
 }
@@ -707,7 +731,6 @@ resource "kubernetes_manifest" "acme_perimeter" {
     kind       = "VPCGatewayFirewallPolicy"
     metadata = {
       name      = "acme-perimeter"
-      namespace = "acme-prod-ns01"
     }
     spec = {
       regionName = var.region_name
@@ -733,11 +756,11 @@ resource "kubernetes_manifest" "acme_tier_isolation" {
     kind       = "FirewallPolicy"
     metadata = {
       name      = "acme-tier-isolation"
-      namespace = "acme-prod-ns01"
     }
     spec = {
       regionName = var.region_name
       category   = "Application"
+      appliedTo  = { groupNames = ["acme-namespace"] }
       rules = [
         {
           name      = "allow-web-to-app"
@@ -774,11 +797,13 @@ resource "kubernetes_manifest" "acme_cache_tier" {
     kind       = "NetworkSecurityGroup"
     metadata = {
       name      = "acme-cache-tier"
-      namespace = "acme-prod-ns01"
     }
     spec = {
-      regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "cache" } } }]
+      regionName = var.region_name
+      vmSelectors = [{
+        labelSelector     = { matchLabels = { tier = "cache" } }
+        namespaceSelector = { matchLabels = { "kubernetes.io/metadata.name" = "acme-prod-ns01" } }
+      }]
     }
   }
 }
