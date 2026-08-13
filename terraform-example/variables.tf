@@ -22,18 +22,8 @@ variable "tenant_org" {
   type        = string
 }
 
-variable "tenant_name" {
-  description = "Name of the tenant, used as a prefix for created resources"
-  type        = string
-}
-
-variable "tenant_namespace" {
-  description = "Kubernetes namespace the tenant's resources are created in"
-  type        = string
-}
-
-variable "tenant_vpc_name" {
-  description = "Name of the tenant's VPC"
+variable "vsphere_namespace" {
+  description = "vSphere Namespace the tenant's resources are created in"
   type        = string
 }
 
