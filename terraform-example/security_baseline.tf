@@ -6,8 +6,8 @@ resource "kubernetes_manifest" "prod01_namespace_group" {
       name = "prod01-namespace"
     }
     spec = {
-      regionName  = "m01-reg01"
-      vmSelectors = [{ labelSelector = { matchLabels = { "nsx-op/vm_namespace" = "prod01-8sg7f" } } }]
+      regionName  = var.region_name
+      vmSelectors = [{ labelSelector = { matchLabels = { "nsx-op/vm_namespace" = var.tenant_namespace } } }]
     }
   }
 }
@@ -23,7 +23,7 @@ resource "kubernetes_manifest" "namespace_isolation_prod01" {
       appliedTo  = { groupNames = [kubernetes_manifest.prod01_namespace_group.manifest.metadata.name] }
       category   = "Environment"
       priority   = 10001
-      regionName = "m01-reg01"
+      regionName = var.region_name
       stateful   = true
       tcpStrict  = true
       rules = [

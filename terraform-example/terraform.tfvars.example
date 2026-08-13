@@ -4,3 +4,6 @@ vcfa_url            = "vcfa.example.com"
 vcfa_insecure        = false
 vcfa_refresh_token   = "CHANGE-ME"
 tenant_org           = "tf-example-org"
+
+tenant_namespace     = "prod01-8sg7f"
+region_name          = "m01-reg01"

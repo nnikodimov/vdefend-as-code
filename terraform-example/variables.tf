@@ -21,3 +21,13 @@ variable "tenant_org" {
   description = "Name of the tenant organization in VCF Automation"
   type        = string
 }
+
+variable "tenant_namespace" {
+  description = "Kubernetes namespace the tenant's resources are created in"
+  type        = string
+}
+
+variable "region_name" {
+  description = "Name of the NSX region the tenant's VPC belongs to"
+  type        = string
+}
