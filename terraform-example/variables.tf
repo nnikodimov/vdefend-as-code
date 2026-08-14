@@ -41,3 +41,8 @@ variable "security_profile_name" {
   description = "Name of the pre-existing SecurityProfile to attach to the tenant's VPC"
   type        = string
 }
+
+variable "monitoring_namespace" {
+  description = "Kubernetes namespace the monitoring scraper's resources are created in"
+  type        = string
+}

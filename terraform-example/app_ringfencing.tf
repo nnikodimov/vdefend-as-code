@@ -53,14 +53,6 @@ resource "kubernetes_manifest" "app01_ringfencing" {
           services        = [{ networkServiceName = ":HTTPS" }]
         },
         {
-          name      = "allow-dns-outbound"
-          direction = "Out"
-          action    = "Allow"
-          from      = [{ groupName = "app01" }]
-          to        = [{ groupName = "Any" }]
-          services  = [{ networkServiceName = ":DNS" }, { networkServiceName = ":DNS-UDP" }]
-        },
-        {
           name      = "app01-lockdown"
           direction = "InOut"
           action    = "Drop"
