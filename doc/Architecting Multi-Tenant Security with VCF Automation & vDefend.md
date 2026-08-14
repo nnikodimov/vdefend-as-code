@@ -111,7 +111,7 @@ Three integrated mechanisms establish and maintain strict isolation between tena
 
 Each persona receives a kubeconfig context scoped strictly to the specific namespaces permitted by their ProjectRoleBinding (authorization.cci.vmware.com). Consequently, the same token that authorizes a developer to deploy a workload also acts as the boundary constraining their visibility across the platform. Resources outside a persona's assigned scope are neither writable nor discoverable through API enumeration — a key requirement that allows platform providers to safely expose standard Kubernetes API endpoints directly to tenants.
 
-This principle applies equally to machine and automation identities (§6, Appendix A). Whether provisioning infrastructure via a Terraform CI runner using a Cloud Consumption Interface (CCI) token, or executing GitOps syncs through an Argo CD service account for teams layering on Appendix A's optional pattern, automation credentials must be scoped strictly to the specific tenant namespace(s) they manage. Granting a pipeline Project-wide or Region-wide administrative credentials — even for platform-owned CI/CD runners — introduces a major security anti-pattern: it quietly undermines the tenant isolation model by creating a backchannel for privilege escalation beyond human authorization boundaries.
+This principle applies equally to machine and automation identities (§6, §8). Whether provisioning infrastructure via a Terraform CI runner using a Cloud Consumption Interface (CCI) token, or executing GitOps syncs through an Argo CD service account for teams layering on that optional pattern (§8), automation credentials must be scoped strictly to the specific tenant namespace(s) they manage. Granting a pipeline Project-wide or Region-wide administrative credentials — even for platform-owned CI/CD runners — introduces a major security anti-pattern: it quietly undermines the tenant isolation model by creating a backchannel for privilege escalation beyond human authorization boundaries.
 
 ---
 
@@ -157,7 +157,7 @@ The schema in this paper is confirmed against a running VCF 9.1 environment (liv
 
 ## 5. Use Cases and Design Patterns
 
-Each subsection below walks through one concrete use case for consuming vDefend security through the VCFA Consumption API: what a tenant needs, the design pattern that solves it, and the API objects that implement it — confirmed against a live VCF 9.1 environment. §6 then shows how Terraform delivers each pattern, day-0 and day-2 alike (Appendix A covers an optional GitOps-based alternative for continuous reconciliation); this section stays at the level of the API itself.
+Each subsection below walks through one concrete use case for consuming vDefend security through the VCFA Consumption API: what a tenant needs, the design pattern that solves it, and the API objects that implement it — confirmed against a live VCF 9.1 environment. §6 then shows how Terraform delivers each pattern, day-0 and day-2 alike (§8 covers an optional GitOps-based alternative for continuous reconciliation); this section stays at the level of the API itself.
 
 ### 5.1 VPC Segmentation
 
@@ -500,6 +500,8 @@ Terraform fits naturally into modern cloud infrastructure architectures where te
 - **vcfa (vmware/vcfa):** Manages provider-admin-level operations across the system domain. This includes the creation and governance of Organizations, Identity Provider configurations, Regional Quotas, Organization Networking, and Regional Networking mappings. Critically, the vcfa provider exposes the vcfa_kubeconfig data source, which dynamically mints short-lived authentication credentials for the All-Apps Organization API surface (Supervisor CCI).
 - **kubernetes (hashicorp/kubernetes):** Represents HashiCorp's standard Kubernetes provider, which applies declarative manifests (kubernetes_manifest) directly against the Supervisor CCI. In VCF 9, every tenant network and security construct is exposed as a Kubernetes CRD under the vpc.nsx.vmware.com/v1alpha1 API group, enabling native management of Projects, VPCs, Subnets, Security Profiles, and Firewall Policies via standard Kubernetes manifests.
 
+**Scenario**: Tenant `acme` needs a `web` / `app` / `db` three-tier application with default-deny micro-segmentation and a locked-down perimeter, permitting only public HTTPS to the web tier, `web → app:8443`, and `app → db:5432`.
+
 ### 6.1 Provider Chain
 
 ```hcl
@@ -533,16 +535,51 @@ provider "kubernetes" {
 ```
 The authentication workflow relies on dynamic credential chaining across provider boundaries. The root vcfa provider authenticates using a high-privilege refresh token or API token to establish administrative organization boundaries. Once the organization exists, the `vcfa_kubeconfig` data source queries VCFA to retrieve temporary API bearer tokens, cluster endpoint URLs, and TLS verification flags. These values are dynamically passed into the kubernetes provider block, enabling immediate, authenticated provisioning of `vpc.nsx.vmware.com/v1alpha1` CRDs without storing static credentials or cluster certificates in state files or repository secrets.
 
-### 6.2 Declaring the Security Baseline
+### 6.2 Declaring the VPC Security Baseline
+
 
 ```hcl
 # security_baseline.tf
-resource "kubernetes_manifest" "prod01_namespace_group" {
+import {
+  to = kubernetes_manifest.patch_profile_attachment
+  id = "apiVersion=vpc.nsx.vmware.com/v1alpha1,kind=SecurityProfileAttachment,var.tenant_vpc_name"
+}
+
+resource "kubernetes_manifest" "patch_profile_attachment" {
+  manifest = {
+    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
+    kind       = "SecurityProfileAttachment"
+    metadata = {
+      name = var.tenant_vpc_name
+    }
+    spec = {
+      regionName          = var.region_name
+      securityProfileName = var.security_profile_name
+      vpcName             = var.tenant_vpc_name
+    }
+  }
+
+  field_manager {
+    force_conflicts = true
+  }
+}
+```
+### 6.3 Segmenting vSphere Namespace
+
+The following Terrafrom scrip creates a dev01_namespace_group Group defined with dynamic matching criteria. Instead of maintaining static member lists, it dynamically groups all workloads provisioned within the dev01 vSphere Namespace as they scale up or down. The  resource then attaches a baseline FirewallPolicy to this group, enforcing the namespace’s default security posture:
+
+- Intra-Namespace (East-West): Allowed with Jump to Application catefory policies and rules.
+- Egress (Outbound): Allowed
+- Ingress (Inbound): Restricted strictly to HTTPS (all other inbound traffic is dropped)
+
+```hcl
+# namespace_segmentation.tf
+resource "kubernetes_manifest" "dev01_namespace_group" {
   manifest = {
     apiVersion = "vpc.nsx.vmware.com/v1alpha1"
     kind       = "NetworkSecurityGroup"
     metadata = {
-      name = "prod01-namespace"
+      name = "dev01-namespace"
     }
     spec = {
       regionName  = var.region_name
@@ -551,15 +588,15 @@ resource "kubernetes_manifest" "prod01_namespace_group" {
   }
 }
 
-resource "kubernetes_manifest" "namespace_isolation_prod01" {
+resource "kubernetes_manifest" "namespace_segmentation_dev01" {
   manifest = {
     apiVersion = "vpc.nsx.vmware.com/v1alpha1"
     kind       = "FirewallPolicy"
     metadata = {
-      name = "namespace-isolation-prod01"
+      name = "namespace-isolation-dev01"
     }
     spec = {
-      appliedTo  = { groupNames = [kubernetes_manifest.prod01_namespace_group.manifest.metadata.name] }
+      appliedTo  = { groupNames = [kubernetes_manifest.dev01_namespace_group.manifest.metadata.name] }
       category   = "Environment"
       priority   = 10001
       regionName = var.region_name
@@ -570,9 +607,10 @@ resource "kubernetes_manifest" "namespace_isolation_prod01" {
           name      = "allow-intra-namespace"
           direction = "InOut"
           action    = "JumpToApplication"
-          from      = [{ groupName = "prod01-namespace" }]
-          to        = [{ groupName = "prod01-namespace" }]
+          from      = [{ groupName = "dev01-namespace" }]
+          to        = [{ groupName = "dev01-namespace" }]
           services  = [{ networkServiceName = "Any" }]
+          appliedTo  = { groupNames = [kubernetes_manifest.dev01_namespace_group.manifest.metadata.name] }
         },
         {
           name      = "allow-https-inbound"
@@ -581,6 +619,7 @@ resource "kubernetes_manifest" "namespace_isolation_prod01" {
           from      = [{ groupName = "Any" }]
           to        = [{ groupName = "Any" }]
           services  = [{ networkServiceName = ":HTTPS" }]
+          appliedTo  = { groupNames = [kubernetes_manifest.dev01_namespace_group.manifest.metadata.name] }
         },
         {
           name      = "block-any-inbound"
@@ -589,66 +628,89 @@ resource "kubernetes_manifest" "namespace_isolation_prod01" {
           from      = [{ groupName = "Any" }]
           to        = [{ groupName = "Any" }]
           services  = [{ networkServiceName = "Any" }]
+          appliedTo  = { groupNames = [kubernetes_manifest.dev01_namespace_group.manifest.metadata.name] }
         }
       ]
     }
   }
 
-  depends_on = [kubernetes_manifest.prod01_namespace_group]
+  depends_on = [kubernetes_manifest.dev01_namespace_group]
 }
 ```
-
-This is the Terraform-managed form of the `NetworkSecurityGroup`/`FirewallPolicy` pair from §5.2: `prod01_namespace_group` creates the namespace-tag group, parameterized by `var.region_name` and `var.tenant_namespace` rather than hardcoded literals. `namespace_isolation_prod01`'s `appliedTo` references the group's own resource attribute (`kubernetes_manifest.prod01_namespace_group.manifest.metadata.name`) instead of retyping its name as a string, which is what avoids the exact "dependent objects... does not exist" failure a mismatched `groupNames` reference produces. Its rules' `from`/`to` fields still reference the group by the literal string `"prod01-namespace"`, though — since Terraform can only infer creation order from an actual attribute reference, the explicit `depends_on` is what guarantees the group exists before the policy that references it by name is submitted. Treat resource and attribute names as subject to the provider's current schema.
 
 ---
 
-## 7. A Worked End-to-End Example
+### 6.4 Ringfencing an Application
 
-**Scenario**: Tenant `acme` needs a `web` / `app` / `db` three-tier application with default-deny micro-segmentation and a locked-down perimeter, permitting only public HTTPS to the web tier, `web → app:8443`, and `app → db:5432`.
-
-### 7.1 Terraform Onboarding
-
-The onboarding pipeline (extending §6.2) creates the Project, VPC, Subnet, baseline `SecurityProfile`/`SecurityProfileAttachment`, and the complete tier-based security posture — tier groups, a locked-down perimeter, tier-isolation rules, and a default-deny baseline — as one module, one state, one `apply`:
+The following resource pair implements the `app01-ringfencing` `FirewallPolicy` from §5.3: an `app01` group built from the protected `protected/app01` label rather than a static IP list, and an Application-category policy that allows intra-app traffic, restricts inbound HTTPS to sources outside the `dev01-namespace` group created in §6.3, permits DNS egress, and drops everything else:
 
 ```hcl
-resource "kubernetes_manifest" "acme_namespace_group" {
+# app_ringfencing.tf
+resource "kubernetes_manifest" "app01_group" {
   manifest = {
     apiVersion = "vpc.nsx.vmware.com/v1alpha1"
     kind       = "NetworkSecurityGroup"
     metadata = {
-      name = "acme-namespace"
+      name = "app01"
     }
     spec = {
       regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { "nsx-op/vm_namespace" = "acme-prod-ns01" } } }]
+      systemOwned = false
+      vmSelectors = [{
+        labelSelector = {
+          matchExpressions = [{ key = "protected/app01", operator = "Exists" }]
+        }
+        namespaceSelector = {
+          matchLabels = { "kubernetes.io/metadata.name" = var.tenant_namespace }
+        }
+      }]
     }
   }
 }
 
-resource "kubernetes_manifest" "default_deny_east_west" {
+resource "kubernetes_manifest" "app01_ringfencing" {
   manifest = {
     apiVersion = "vpc.nsx.vmware.com/v1alpha1"
     kind       = "FirewallPolicy"
     metadata = {
-      name      = "acme-default-deny"
+      name = "app01-ringfencing"
     }
     spec = {
-      regionName = var.region_name
+      appliedTo  = { groupNames = [kubernetes_manifest.app01_group.manifest.metadata.name] }
       category   = "Application"
+      priority   = 10002
+      regionName = var.region_name
       stateful   = true
-      appliedTo  = { groupNames = ["acme-namespace"] }
+      tcpStrict  = true
       rules = [
         {
-          name      = "deny-all-in"
-          direction = "In"
-          action    = "Drop"
-          from      = [{ groupName = "Any" }]
-          to        = [{ groupName = "Any" }]
+          name      = "allow-app01-intra"
+          direction = "InOut"
+          action    = "Allow"
+          from      = [{ groupName = "app01" }]
+          to        = [{ groupName = "app01" }]
           services  = [{ networkServiceName = "Any" }]
         },
         {
-          name      = "deny-all-out"
+          name            = "allow-https-inbound"
+          direction       = "In"
+          action          = "Allow"
+          from            = [{ groupName = kubernetes_manifest.dev01_namespace_group.manifest.metadata.name }]
+          sourcesExcluded = true
+          to              = [{ groupName = "app01" }]
+          services        = [{ networkServiceName = ":HTTPS" }]
+        },
+        {
+          name      = "allow-dns-outbound"
           direction = "Out"
+          action    = "Allow"
+          from      = [{ groupName = "app01" }]
+          to        = [{ groupName = "Any" }]
+          services  = [{ networkServiceName = ":DNS" }, { networkServiceName = ":DNS-UDP" }]
+        },
+        {
+          name      = "app01-lockdown"
+          direction = "InOut"
           action    = "Drop"
           from      = [{ groupName = "Any" }]
           to        = [{ groupName = "Any" }]
@@ -657,291 +719,61 @@ resource "kubernetes_manifest" "default_deny_east_west" {
       ]
     }
   }
-}
 
-resource "kubernetes_manifest" "acme_web_tier" {
-  manifest = {
-    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
-    kind       = "NetworkSecurityGroup"
-    metadata = {
-      name      = "acme-web-tier"
-    }
-    spec = {
-      regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "web" } } }]
-    }
-  }
-}
-
-resource "kubernetes_manifest" "acme_app_tier" {
-  manifest = {
-    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
-    kind       = "NetworkSecurityGroup"
-    metadata = {
-      name      = "acme-app-tier"
-    }
-    spec = {
-      regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "app" } } }]
-    }
-  }
-}
-
-resource "kubernetes_manifest" "acme_db_tier" {
-  manifest = {
-    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
-    kind       = "NetworkSecurityGroup"
-    metadata = {
-      name      = "acme-db-tier"
-    }
-    spec = {
-      regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "db" } } }]
-    }
-  }
-}
-
-resource "kubernetes_manifest" "acme_web_tier_vpc" {
-  manifest = {
-    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
-    kind       = "VPCNetworkSecurityGroup"
-    metadata = {
-      name      = "acme-web-tier-vpc"
-    }
-    spec = {
-      vpcName     = "acme-prod-vpc01"
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "web" } } }]
-    }
-  }
+  depends_on = [kubernetes_manifest.app01_group, kubernetes_manifest.dev01_namespace_group]
 }
 ```
 
-`acme_web_tier_vpc` mirrors `acme_web_tier` as a separate `VPCNetworkSecurityGroup` — `VPCGatewayFirewallPolicy` rules can't reference the region-scoped `NetworkSecurityGroup` kind (§3.2).
+`sourcesExcluded = true` negates the `from` match on `allow-https-inbound`, so the rule reads as "allow HTTPS from anywhere *except* the `dev01-namespace` group" — keeping inbound HTTPS open to external and other-namespace clients while denying it from dev workloads specifically. Rule order matters here: NSX evaluates a `FirewallPolicy`'s `rules` list top to bottom, so `app01-lockdown`'s match-all `Drop` has to stay last, or it would shadow every rule below it.
+
+Nothing here is handed off to a second tool or a separate Git path — the namespace baseline from §6.3, the `app01` group, and its ringfencing rules all live in the same tenant module and state from §6.2, applied atomically.
+
+### 6.5 Day-2, Tenant-Driven Change
+
+Acme's app team needs to expose a metrics endpoint to Acme's monitoring VPC. `monitoring01` lives in its own namespace, not `dev01-namespace`, so this traffic doesn't qualify for the `allow-intra-namespace` `JumpToApplication` rule in the Environment-category policy from §6.3 — left alone, it would instead fall through to that same policy's `block-any-inbound` Drop rule. The day-2 PR against the *same Terraform config repo* adds a new `monitoring01` group for the scraper source and a rule inserted directly into `namespace_segmentation_dev01`'s `rules` list — ahead of `block-any-inbound` — that `Allow`s the specific monitoring-to-`app01` path outright, without needing a matching rule in `app01_ringfencing`'s Application-category policy at all:
 
 ```hcl
-resource "kubernetes_manifest" "acme_perimeter" {
-  manifest = {
-    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
-    kind       = "VPCGatewayFirewallPolicy"
-    metadata = {
-      name      = "acme-perimeter"
-    }
-    spec = {
-      regionName = var.region_name
-      vpcName    = "acme-prod-vpc01"
-      category   = "LocalGatewayRules"
-      rules = [
-        {
-          name      = "allow-inbound-https"
-          direction = "In"
-          action    = "Allow"
-          from      = [{ groupName = "Any" }]
-          to        = [{ groupName = "acme-web-tier-vpc" }]
-          services  = [{ l4PortSet = { l4Protocol = "TCP", destinationPorts = ["443"] } }]
-        },
-        {
-          name      = "deny-all-other-inbound"
-          direction = "In"
-          action    = "Drop"
-          from      = [{ groupName = "Any" }]
-          to        = [{ groupName = "Any" }]
-          services  = [{ networkServiceName = "Any" }]
-        }
-      ]
-    }
-  }
-}
-
-resource "kubernetes_manifest" "app_tier_group" {
+resource "kubernetes_manifest" "monitoring01_group" {
   manifest = {
     apiVersion = "vpc.nsx.vmware.com/v1alpha1"
     kind       = "NetworkSecurityGroup"
     metadata = {
-      name      = "${var.tenant_name}-app-tier"
+      name = "monitoring01"
     }
     spec = {
       regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "app" } } }]
+      vmSelectors = [{ labelSelector = { matchLabels = { "nsx-op/vm_namespace" = var.monitoring_namespace } } }]
     }
   }
 }
 
-resource "kubernetes_manifest" "acme_tier_isolation" {
-  manifest = {
-    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
-    kind       = "FirewallPolicy"
-    metadata = {
-      name      = "acme-tier-isolation"
-    }
-    spec = {
-      regionName = var.region_name
-      category   = "Application"
-      appliedTo = { groupNames = [kubernetes_manifest.app_tier_group.manifest.metadata.name] }
-      rules = [
-        {
-          name      = "allow-web-to-app"
-          direction = "In"
-          action    = "Allow"
-          from      = [{ groupName = "acme-web-tier" }]
-          to        = [{ groupName = "acme-app-tier" }]
-          services  = [{ l4PortSet = { l4Protocol = "TCP", destinationPorts = ["8443"] } }]
-        },
-        {
-          name      = "allow-app-to-db"
-          direction = "In"
-          action    = "Allow"
-          from      = [{ groupName = "acme-app-tier" }]
-          to        = [{ groupName = "acme-db-tier" }]
-          services  = [{ l4PortSet = { l4Protocol = "TCP", destinationPorts = ["5432"] } }]
-        }
-      ]
-    }
-  }
-}
-```
-
-Nothing here is handed off to a second tool or a separate Git path — the default-deny baseline, the tier groups, the perimeter, and the tier-isolation rules all live in the same tenant module and state from §6.2, applied atomically.
-
-### 7.2 Day-2, Tenant-Driven Change
-
-Acme's app team adds a `cache` tier. Their security engineer opens a PR against the *same Terraform config repo*, adding a new `kubernetes_manifest.acme_cache_tier` resource and a new rule block appended to `acme_tier_isolation`'s `rules` list:
-
-```hcl
-resource "kubernetes_manifest" "acme_cache_tier" {
-  manifest = {
-    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
-    kind       = "NetworkSecurityGroup"
-    metadata = {
-      name      = "acme-cache-tier"
-    }
-    spec = {
-      regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { tier = "cache" } } }]
-    }
-  }
-}
-
-# appended to kubernetes_manifest.acme_tier_isolation.manifest.spec.rules:
+# inserted into kubernetes_manifest.namespace_segmentation_dev01.manifest.spec.rules,
+# ahead of the "block-any-inbound" rule:
 #   {
-#     name      = "allow-app-to-cache"
+#     name      = "allow-monitoring-to-app01"
 #     direction = "In"
 #     action    = "Allow"
-#     from      = [{ groupName = "acme-app-tier" }]
-#     to        = [{ groupName = "acme-cache-tier" }]
-#     services  = [{ l4PortSet = { l4Protocol = "TCP", destinationPorts = ["6379"] } }]
+#     from      = [{ groupName = kubernetes_manifest.monitoring01_group.manifest.metadata.name }]
+#     to        = [{ groupName = kubernetes_manifest.app01_group.manifest.metadata.name }]
+#     services  = [{ l4PortSet = { l4Protocol = "TCP", destinationPorts = ["9090"] } }]
 #   }
 ```
 
-Once merged and approved by the `CODEOWNERS`-designated security lead, CI runs the same `terraform plan`/`apply` pipeline from §6.1 — no separate GitOps controller, no platform-team ticket, and the default-deny `FirewallPolicy` and locked-down `VPCGatewayFirewallPolicy` still govern anything not explicitly matched. From empty namespace to a fully isolated, micro-segmented, internet-facing-only-where-intended application, the whole path took the time it took to merge a pull request and let CI apply it — not the days or weeks a ticket-driven model would have taken. (Appendix A shows this same change delivered as a GitOps-synced PR instead, for teams that have adopted that optional pattern.)
-
-### 7.3 Multi-VPC Extension
-
-If Acme later splits into a `prod` VPC and a `shared-services` VPC on a common Transit Gateway, a `TGWFirewallPolicy` (§5.5) is added to allow only the specific east-west paths needed between them, rather than relying on the coarser connectivity posture alone — just another `kubernetes_manifest` resource in the same Terraform module and state as everything else in this section.
+Once merged and approved by the `CODEOWNERS`-designated security lead, CI runs the same `terraform plan`/`apply` pipeline from §6.1 — no separate GitOps controller, no platform-team ticket, and `block-any-inbound` still governs anything not explicitly matched. From empty namespace to a fully ringfenced application exposing only the traffic it explicitly allows, the whole path took the time it took to merge a pull request and let CI apply it — not the days or weeks a ticket-driven model would have taken. (§8 discusses the equivalent GitOps-based day-2 model for teams that have adopted that optional pattern.)
 
 ---
 
 ## 8. Conclusion
 
-Multi-tenant security in VCF 9.1 works when it is designed as a set of composable, API-addressable layers — VPC-level Security Profiles, namespace isolation, application ringfencing, and Transit Gateway policy — each with a clear owner and a clear delegation boundary (§3, §5). Because every layer is a Kubernetes-native custom resource under the VCFA Consumption API (§4), the same design pattern is automatable on day one with a single tool a platform team already runs: Terraform, end-to-end, for both the atomic, reviewed day-0 baseline and every day-2 policy change that follows it (§6) — with GitOps-based continuous reconciliation available as an optional layer for teams that want it (Appendix A). §5 and §7 show that model holding up against real, live-environment scenarios — not just a diagram.
+Multi-tenant security in VCF 9.1 works when it is designed as a set of composable, API-addressable layers — VPC-level Security Profiles, namespace isolation, application ringfencing, and Transit Gateway policy — each with a clear owner and a clear delegation boundary (§3, §5). Because every layer is a Kubernetes-native custom resource under the VCFA Consumption API (§4), the same design pattern is automatable on day one with a single tool a platform team already runs: Terraform, end-to-end, for both the atomic, reviewed day-0 baseline and every day-2 policy change that follows it (§6). §5 and §6 show that model holding up against real, live-environment scenarios — not just a diagram.
+
+Terraform's periodic `apply` is this paper's default, but it isn't the only valid operating model — because every security object in §6 is just a Kubernetes-native CRD under `vpc.nsx.vmware.com/v1alpha1`, the same objects are equally addressable by a GitOps controller like Argo CD, layered on top rather than replacing it. Each tenant's CCI-scoped kubeconfig registers as an Argo CD cluster target, RBAC-limited to that tenant's namespace and never cluster-admin on the shared Supervisor; an `ApplicationSet` fans a single template out into one `Application` per tenant; and `sync-wave` ordering keeps Groups landing before the policies that reference them, and default-deny baselines landing before the allow rules layered on top of them. The tradeoff for teams that adopt it is continuous drift correction and self-service via a Git merge instead of a pipeline run, at the cost of a second control plane and its own RBAC surface to secure — worthwhile for a platform team reconciling many tenants continuously, unnecessary overhead for one applying periodic, reviewed changes.
 
 **The final thought worth remembering:** by moving enforcement into the hypervisor and consuming it through the same Terraform surface as every other piece of infrastructure, security stops being a checkpoint someone has to clear and becomes an ambient property of the platform itself. VCF with vDefend doesn't just secure applications — it lets security be measured the way the rest of the business measures itself: faster time-to-market, lower operational cost, and continuous, demonstrable compliance.
 
 ---
 
-## Appendix A. Continuous Day-2 Operations with Argo CD (GitOps)
-
-§6 and §7 show this paper's default model: Terraform, end-to-end, for both the day-0 baseline and every day-2 change. Some platform teams want more than periodic `apply` — an always-on reconciliation loop with continuous drift correction, self-service via a Git merge instead of a pipeline run, and native per-tenant fan-out. This appendix shows how to layer Argo CD GitOps reconciliation on top of the same CCI-exposed objects, as an optional pattern rather than this paper's default.
-
-### A.1 Why GitOps for Continuous Security Policy
-
-Security policy is not "set once at provisioning" — it changes continuously as tenant applications evolve (new microservice, new port, decommissioned tier). Treating it as a one-time Terraform apply leaves a gap for exactly the kind of manual, undocumented change that turns into an audit finding. Argo CD's continuous reconciliation loop closes that gap:
-
-- **Drift correction.** If someone manually edits a `FirewallPolicy` or `NetworkSecurityGroup` via `kubectl` or the CCI UI, Argo CD reverts it (or flags `OutOfSync`) on the next sync — Git remains the enforceable source of truth for security posture.
-- **Self-service without a pipeline run.** Tenant security engineers merge a PR against their tenant's policy repo; Argo CD picks it up within its poll/webhook interval — no separate CI job needs to hold cloud credentials.
-- **Native multi-tenant fan-out** via `ApplicationSet`, generating one Argo CD `Application` per tenant from a single template.
-
-### A.2 Registering a Tenant's vSphere Namespace as an Argo CD Target
-
-Each tenant's CCI kubeconfig (obtained once, out-of-band or via the same `vcfa_kubeconfig` Terraform data source used for bootstrapping in §6.2) is registered as an Argo CD cluster secret, scoped so Argo CD's service account only has RBAC (via `authorization.cci.vmware.com`) within that tenant's namespace(s) — never cluster-admin on the shared Supervisor.
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: acme-prod-cci-cluster
-  namespace: argocd
-  labels:
-    argocd.argoproj.io/secret-type: cluster
-type: Opaque
-stringData:
-  name: acme-prod-supervisor-ns
-  server: https://cci.vcfa.example.com
-  config: |
-    {
-      "bearerToken": "<scoped-service-account-token>",
-      "tlsClientConfig": { "insecure": false, "caData": "<base64-ca>" }
-    }
-```
-
-### A.3 Per-Tenant Application via ApplicationSet
-
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: ApplicationSet
-metadata:
-  name: tenant-vdefend-policies
-  namespace: argocd
-spec:
-  generators:
-    - list:
-        elements:
-          - tenant: acme
-            namespace: acme-prod-ns01
-            cluster: acme-prod-supervisor-ns
-          - tenant: globex
-            namespace: globex-prod-ns01
-            cluster: globex-prod-supervisor-ns
-  template:
-    metadata:
-      name: "{{tenant}}-vdefend-policy"
-    spec:
-      project: tenant-security
-      source:
-        repoURL: https://git.example.com/platform/tenant-security-policies.git
-        targetRevision: main
-        path: "tenants/{{tenant}}/security-policy"
-      destination:
-        name: "{{cluster}}"
-        namespace: "{{namespace}}"
-      syncPolicy:
-        automated:
-          prune: true      # remove groups/policies deleted from Git
-          selfHeal: true    # revert manual/out-of-band drift
-        syncOptions:
-          - CreateNamespace=false   # namespace lifecycle stays with Terraform, not GitOps
-```
-
-`tenants/acme/security-policy/` in Git contains plain `NetworkSecurityGroup` / `FirewallPolicy` / `VPCGatewayFirewallPolicy` / `TGWFirewallPolicy` YAML — the shapes from §4.3 and the worked example in §7 — reviewed via standard pull request workflow, ideally with a `CODEOWNERS` entry requiring the tenant's security lead to approve changes to their own policy.
-
-### A.4 Ordering and Safety
-
-- Use `argocd.argoproj.io/sync-wave` annotations to guarantee `NetworkSecurityGroup` objects (wave 0) and the default-deny `FirewallPolicy`/`VPCGatewayFirewallPolicy` (wave 1) land before more permissive tier-specific allow rules (wave 2+) — groups must exist before a policy can reference them, and a default-deny baseline should never trail its allow rules into the cluster.
-- Run Argo CD in **non-selfHeal, manual-sync mode for a probation period** on newly onboarded tenants, flipping to `automated.selfHeal: true` once the baseline policy has been validated in a lower environment — this gives a soft rollout path for a capability that can otherwise instantly enforce a mistake fleet-wide.
-
-### A.5 Applying Argo CD to Each Design Pattern
-
-Restating, per §5 pattern, exactly what Argo CD reconciles at day-2, as an alternative to this paper's Terraform-owned default (§6, §7):
-
-- **VPC Segmentation (§5.1):** a strategy change — e.g. moving a `dev` VPC from `none` to `vpc-isolation` — is a one-line diff to `SecurityProfileAttachment.spec.securityProfileName` in the tenant's Git path, synced automatically.
-- **Namespace Segmentation (§5.2):** any `Application`-category rule opening a specific port between namespaces is added as a normal PR against the tenant's policy repo; the `Environment`-category isolation policy still governs anything not explicitly matched.
-- **Application Ringfencing (§5.3):** because a new application being ringfenced is exactly the kind of change that happens continuously as a tenant's portfolio grows, this is squarely a GitOps-friendly change — a PR adding the app's group and policy to the tenant's Git path, reviewed by `CODEOWNERS`, synced automatically.
-- **Transit Gateway (§5.5):** tenant-specific `TGWFirewallPolicy` rules are layered in the same way as any other tenant policy change, reviewed and synced from the tenant's Git path.
-
-Day-0 Provisioned Security (§5.4) is fully owned by Terraform at onboarding regardless of which day-2 model a team chooses — see §6.2.
-
----
-
-## Appendix B. Glossary
+## Appendix A. Glossary
 
 | Term | Meaning |
 |---|---|
@@ -958,7 +790,7 @@ Day-0 Provisioned Security (§5.4) is fully owned by Terraform at onboarding reg
 | **Privileged (protected) label** | A VCFA label whose application and removal are RBAC-controlled, translated to an NSX tag; lets an Organization's admins key policy to a marker its application teams cannot reassign |
 | **Micro-segmentation** | Fine-grained, per-workload network isolation, independent of subnet/VLAN |
 | **GitOps** | Operating infrastructure by reconciling live state against a Git repository |
-| **Argo CD** | The GitOps controller Appendix A uses for its optional, continuous day-2 policy reconciliation pattern |
+| **Argo CD** | The GitOps controller §8 discusses as an optional, continuous day-2 policy reconciliation pattern |
 | **ApplicationSet** | Argo CD's mechanism for generating one `Application` per tenant from a template |
 | **sync-wave** | An Argo CD annotation controlling apply order across resources in a sync |
 | **kubeconfig** | The credential/context bundle a tenant or pipeline uses to reach CCI |
@@ -967,7 +799,7 @@ Day-0 Provisioned Security (§5.4) is fully owned by Terraform at onboarding reg
 
 ---
 
-## Appendix C. Additional Resources
+## Appendix B. Additional Resources
 
 - Broadcom Developer Portal — [CCI API Reference (`xapis/cci-api`, `vpc.nsx.vmware.com/v1alpha1`)](https://developer.broadcom.com/xapis/cci-api/latest/api-docs.html#k8s-api-vpc-nsx-vmware-com-v1alpha1)
 - Broadcom TechDocs — [Firewall Policies in an NSX VPC](https://techdocs.broadcom.com/us/en/vmware-cis/nsx/vmware-nsx/9-0/administration-guide/nsx-multi-tenancy/nsx-virtual-private-clouds/firewall-policies-in-an-nsx-vpc.html)
