@@ -1,59 +1,23 @@
-resource "kubernetes_manifest" "prod01_namespace_group" {
-  manifest = {
-    apiVersion = "vpc.nsx.vmware.com/v1alpha1"
-    kind       = "NetworkSecurityGroup"
-    metadata = {
-      name = "prod01-namespace"
-    }
-    spec = {
-      regionName  = var.region_name
-      vmSelectors = [{ labelSelector = { matchLabels = { "nsx-op/vm_namespace" = var.tenant_namespace } } }]
-    }
-  }
+import {
+  to = kubernetes_manifest.patch_profile_attachment
+  id = "apiVersion=vpc.nsx.vmware.com/v1alpha1,kind=SecurityProfileAttachment,var.tenant_vpc_name"
 }
 
-resource "kubernetes_manifest" "namespace_isolation_prod01" {
+resource "kubernetes_manifest" "patch_profile_attachment" {
   manifest = {
     apiVersion = "vpc.nsx.vmware.com/v1alpha1"
-    kind       = "FirewallPolicy"
+    kind       = "SecurityProfileAttachment"
     metadata = {
-      name = "namespace-isolation-prod01"
+      name = var.tenant_vpc_name
     }
     spec = {
-      appliedTo  = { groupNames = [kubernetes_manifest.prod01_namespace_group.manifest.metadata.name] }
-      category   = "Environment"
-      priority   = 10001
-      regionName = var.region_name
-      stateful   = true
-      tcpStrict  = true
-      rules = [
-        {
-          name      = "allow-intra-namespace"
-          direction = "InOut"
-          action    = "JumpToApplication"
-          from      = [{ groupName = "prod01-namespace" }]
-          to        = [{ groupName = "prod01-namespace" }]
-          services  = [{ networkServiceName = "Any" }]
-        },
-        {
-          name      = "allow-https-inbound"
-          direction = "In"
-          action    = "Allow"
-          from      = [{ groupName = "Any" }]
-          to        = [{ groupName = "Any" }]
-          services  = [{ networkServiceName = ":HTTPS" }]
-        },
-        {
-          name      = "block-any-inbound"
-          direction = "In"
-          action    = "Drop"
-          from      = [{ groupName = "Any" }]
-          to        = [{ groupName = "Any" }]
-          services  = [{ networkServiceName = "Any" }]
-        }
-      ]
+      regionName          = var.region_name
+      securityProfileName = var.security_profile_name
+      vpcName             = var.tenant_vpc_name
     }
   }
 
-  depends_on = [kubernetes_manifest.prod01_namespace_group]
+  field_manager {
+    force_conflicts = true
+  }
 }

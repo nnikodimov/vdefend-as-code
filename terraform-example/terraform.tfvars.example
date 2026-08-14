@@ -7,3 +7,5 @@ tenant_org           = "tf-example-org"
 
 tenant_namespace     = "prod01-8sg7f"
 region_name          = "m01-reg01"
+tenant_vpc_name      = "prod01-vpc01"
+security_profile_name = "default-security-profile"
