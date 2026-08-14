@@ -59,9 +59,9 @@ A provider admin establishes top-level administrative boundaries, while tenant u
 
 - **Organization:** The top-level tenant identity, governance, and quota boundary. Provisioning an Organization automatically provisions a corresponding NSX Project — a dedicated fabric-side domain that isolates tenant network addressing, routing, and security policies.
   - **Region:** Aggregates one or more vSphere Supervisors, compute clusters, storage, and shared NSX Manager instances into a placement target. Regions define security scope: vDefend constructs are Region-scoped, requiring tenants spanning multiple Regions to maintain security definitions within each.
+    - **Virtual Private Cloud (VPC):** Realized as an NSX VPC inside the tenant's NSX Project. Provides a self-contained routed network domain with private address spaces, customizable subnets, local VPC Gateways, and Transit Gateway attachments for tenant outside connectivity.
+    - **vDefend Security:** Realized as DFW and GFW (TGW and/or VPC gateway) policies and rules, groups and services.
     - **Project:** The self-service consumption boundary where tenant users operate. It carries assigned quotas and entitlements (accessible Regions, namespace classes, VM classes, storage policies) and bounds all tenant security policies.
-      - **Virtual Private Cloud (VPC):** Realized as an NSX VPC inside the tenant's NSX Project. Provides a self-contained routed network domain with private address spaces, customizable subnets, local VPC Gateways, and optional Transit Gateway attachments. The VPC boundary is where Security Profiles attach and North-South perimeter traffic is evaluated.
-        - **Subnet(s):** The underlying IP address space where workloads reside.
       - **vSphere Namespace:** A Kubernetes resource boundary mapped to a vSphere resource pool and folder carrying compute, memory, and storage limits. Each namespace binds to exactly one VPC, either as a dedicated (1:1) binding for strict isolation or a shared (N:1) binding to pool IP address space and gateway configurations across multiple namespaces.
         - **VirtualMachines:** Virtual machines managed via the VM Service Operator.
         - **VKS Cluster(s):** Kubernetes clusters whose control plane and worker nodes are provisioned as VMs on the same VPC subnets.
@@ -115,7 +115,7 @@ This principle applies equally to machine and automation identities (§6, §8). 
 
 ---
 
-## 4. Consuming vDefend Through the CCI API
+## 4. Consuming vDefend Through the CCI
 
 ### 4.1 CCI as a Standard Kubernetes API Server
 
