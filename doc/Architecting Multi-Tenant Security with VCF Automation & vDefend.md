@@ -73,7 +73,7 @@ vDefend security capabilities layer directly onto the VCFA infrastructure hierar
 
 **Enforcement Points Across Boundaries**
 
-- **Distributed Firewall (DFW):** LLateral Security (East-West) workload protection applied directly at the workload interface. Filters traffic within a VPC and namespaces or across VPCs without requiring traffic to route through a central bottleneck.
+- **Distributed Firewall (DFW):** Lateral Security (East-West) workload protection applied directly at the workload interface. Filters traffic within a VPC and namespaces or across VPCs without requiring traffic to route through a central bottleneck.
 - **Transit Gateway Firewall:** North-South enforcement at the **Organization boundary** — the Transit Gateway is where a tenant's VPCs meet everything outside them, so this is the control point for what may enter or leave the tenant's domain as a whole.
 - **VPC Gateway Firewall:** North-South enforcement at the **VPC perimeter edge**, filtering ingress and egress for a single VPC. Controls external exposure and ingress exceptions.
 
@@ -87,7 +87,7 @@ Security Profiles package East-West strategy and VPC Gateway Firewall state into
 
 - **Groups:** Rule targets defined dynamically using label selectors, namespace membership, VM properties, CIDR blocks, or nested groups. Groups exist in two scopes: Region-scoped (referenced by DFW and Transit Gateway rules) and VPC-scoped (referenced by VPC Gateway rules).
 - **Protected (Privileged) Labels:** Prefixed with protected/, these are specific workload labels that translate directly into NSX tags for group matching and security policy enforcement. They are restricted to authorized users only by a specific Role-Based Access Control (RBAC) permission. This RBAC barrier ensures application teams cannot remove mandatory compliance controls, bypass security policies, or self-assign elevated privileges on their workloads.
-- **Services:** Named, reusable protocol and port definitions (TCP/UDP port sets, ICMP) and raw prtotocol support.
+- **Services:** Named, reusable protocol and port definitions (TCP/UDP port sets, ICMP) and raw protocol support.
 
 ### 3.3 Who Can Change What: The RBAC Model
 
@@ -103,7 +103,7 @@ Three integrated mechanisms establish and maintain strict isolation between tena
 
 | Persona Tier | Role Name | Scope & Ownership | Guardrails & Restrictions |
 |---|---|---|---|
-| **Provider Tier** | **Cloud Admin (Provider) / Provider Security Admin** | Global infrastructure constructs: Organizations, Regions, Projects, resource quota policies, SupervisorNamespaceClass templates, and Region-Zone associations. Configures pre-tenant self-service guardrails. | Cannot provision tenant workloads directly or bypass multi-tenant namespace isolation boundaries. Provider-level security is authored in NSX. Enforce cross-tenant policy using the Default Project. |
+| **Provider Tier** | **Cloud Admin (Provider) / Provider Security Admin** | Global infrastructure constructs: Organizations, Regions, Projects, resource quota policies, SupervisorNamespaceClass templates, and Region-Zone associations. Configures pre-tenant self-service guardrails. | Cannot provision tenant workloads directly, bypass multi-tenant namespace isolation boundaries, or enforce cross-tenant policy except through the Default Project. Provider-level security is authored in NSX. |
 | **Tenant Tier** | **Organization Admin / Security Admin** | Tenant Projects, NSX Virtual Private Clouds (VPCs), vSphere Namespaces, Security Strategy selection (Security Profile selection), organization-wide default security strategies, Transit Gateway Security, DFW Environment and Application category policies. VPC Gateway Firewall toggles, protected resource labels, and Org-wide policies. | Cannot create security strategies outside the organization scope or modify profile-generated provider baselines. |
 | **Tenant Tier** | **Application Owner / Developer** | Application workloads (VMs, VKS Kubernetes clusters, Data Services), standard workload labels, and Application-category groups/policies inside assigned namespaces. | Cannot assign or remove protected labels, bypass namespace boundaries, or override VPC-level security postures set above them. |
 
@@ -132,8 +132,8 @@ CCI presents the constructs discussed in §3 across a handful of API groups. Ten
 | `project.cci.vmware.com/v1alpha2` | Tenant Project definition (the top-level multi-tenancy boundary) |
 | `infrastructure.cci.vmware.com` | Namespace classes, quotas, zone/region association — the guardrails a provider admin sets before self-service access |
 | `authorization.cci.vmware.com` | RBAC / role bindings scoped to a Project or namespace |
-| `vpc.nsx.vmware.com/v1alpha1` | **VPC networking and security**: `VPC`, `Subnet`, `NetworkSecurityGroup`/`VPCNetworkSecurityGroup`, `NetworkService`, `SecurityProfile`/`SecurityProfileAttachment`, `FirewallPolicy`, `VPCGatewayFirewallPolicy`, `TGWFirewallPolicy`/`TGWSecurityConfig`, `VPCConnectivityProfile`/`Binding` |
-| `vmoperator.vmware.com/v1alpha3` | VM lifecycle — the workloads the security policy protects |
+| `vpc.nsx.vmware.com/v1alpha1` | **Security APIs**: `NetworkSecurityGroup`/`VPCNetworkSecurityGroup`, `NetworkService`, `SecurityProfile`/`SecurityProfileAttachment`, `FirewallPolicy`, `VPCGatewayFirewallPolicy`, `TGWFirewallPolicy`/`TGWSecurityConfig`|
+| `vmoperator.vmware.com/v1alpha5` | VM lifecycle — the workloads the security policy protects |
 
 ### 4.3 Security Capabilities and the Kinds That Express Them
 
@@ -235,7 +235,7 @@ In the Dedicated VPC model, the namespace boundary and the network VPC boundary 
 - **Dedicated VPC** — the blueprint establishes a strict one-to-one mapping between a vSphere Namespace and a VPC. vDefend Security Profiles (§5.1) attached directly to the VPC can govern ingress and egress traffic crossing the VPC boundary, serving as the explicit security posture for the contained namespace. Because no other application namespaces reside within the same VPC address space, east-west network isolation between namespaces is guaranteed by the vDefend Security Strategy chosen.
 - **Shared VPC** — the Shared VPC blueprint enables multiple vSphere Namespaces to occupy a single VPC address space, sharing a common VPC Gateway. This pattern is commonly deployed for application ecosystems that belong to a single administrative trust boundary (such as related production namespaces `prod01` and `prod02`). Consolidating namespaces into a shared VPC optimizes IP address space allocation, simplifies overall network routing, and allows for pooled network resource quotas. The traffic moving between subnets inside the same VPC is natively routed across distributed switches without traversing the VPC Gateway firewall. All Security Profiles have a default strategy to conditionally allow (**Jump to Application**) intra-VPC traffic, relying on more-granular DFW application category policies when such segmentation is required. To prevent unrestricted lateral movement between VPC co-located namespaces, platform teams must therefore deploy namespace-scoped Distributed Firewall (DFW) policies.
 
-To bypass the operational burden of manually tracking IP address allocations when provisioning workloads, the Supervisor incorporates an automated infrastructure metadata tagging mechanism. When virtual machines, container hosts, or network interfaces are provisioned within a vSphere Namespace, the Supervisor automatically attaches standardized key-value tags to the underlying network constructs. In VCF Networking with VPC stack deployments, the Supervisor automatically applies the tag `nsx-op/vm_namespace` set to the namespace's name on every VPC subnet segment port created within that namespace. In deployments utilizing NSX Classic mode or legacy segment models, the system tags the NSX Segment directly using the scope `kubernetes.io/metadata.name`.
+To bypass the operational burden of manually tracking IP address allocations when provisioning workloads, the Supervisor incorporates an automated infrastructure metadata tagging mechanism. When virtual machines, container hosts, or network interfaces are provisioned within a vSphere Namespace, the Supervisor automatically attaches standardized key-value tags to the underlying network constructs. The Supervisor automatically applies the tag `nsx-op/vm_namespace`, set to the namespace's name, to every VPC subnet segment port created within that namespace.
 
 These auto-generated tags enable security architects to construct generic, dynamic Groups using label selectors. Rather than defining static IPv4 objects, the dynamic Group matches any segment port where the tag key `nsx-op/vm_namespace` equals the target namespace identifier.
 
@@ -462,7 +462,7 @@ metadata:
   name: acme-shared-services-access
 spec:
   category: LocalGatewayRules
-  regionName: region-a
+  regionName: m01-reg01
   rules:
   - action: Allow
     appliedTo:
@@ -500,7 +500,7 @@ Terraform fits naturally into modern cloud infrastructure architectures where te
 - **vcfa (vmware/vcfa):** Manages provider-admin-level operations across the system domain. This includes the creation and governance of Organizations, Identity Provider configurations, Regional Quotas, Organization Networking, and Regional Networking mappings. Critically, the vcfa provider exposes the vcfa_kubeconfig data source, which dynamically mints short-lived authentication credentials for the All-Apps Organization API surface (Supervisor CCI).
 - **kubernetes (hashicorp/kubernetes):** Represents HashiCorp's standard Kubernetes provider, which applies declarative manifests (kubernetes_manifest) directly against the Supervisor CCI. In VCF 9, every tenant network and security construct is exposed as a Kubernetes CRD under the vpc.nsx.vmware.com/v1alpha1 API group, enabling native management of Projects, VPCs, Subnets, Security Profiles, and Firewall Policies via standard Kubernetes manifests.
 
-**Scenario**: Tenant `acme` needs a `web` / `app` / `db` three-tier application with default-deny micro-segmentation and a locked-down perimeter, permitting only public HTTPS to the web tier, `web → app:8443`, and `app → db:5432`.
+**Scenario**: Tenant `acme`'s `dev01` vSphere Namespace lives in the `dev-vpc` VPC, which keeps the `vpc-isolation-with-essential-services` Security Profile attached as its perimeter baseline (§5.1) — blocking VPC ingress/egress except essential services like DNS. Within that VPC, `dev01` needs a namespace-wide default-deny baseline that permits only inbound HTTPS and intra-namespace traffic, and its `app01` application ringfenced further still, so intra-app traffic is allowed, inbound HTTPS is restricted to sources outside `dev01`, DNS egress is permitted, and everything else is dropped by default.
 
 ### 6.1 Provider Chain
 
@@ -537,7 +537,6 @@ The authentication workflow relies on dynamic credential chaining across provide
 
 ### 6.2 Declaring the VPC Security Baseline
 
-
 ```hcl
 # security_baseline.tf
 import {
@@ -566,7 +565,7 @@ resource "kubernetes_manifest" "patch_profile_attachment" {
 ```
 ### 6.3 Segmenting vSphere Namespace
 
-The following Terrafrom scrip creates a dev01_namespace_group Group defined with dynamic matching criteria. Instead of maintaining static member lists, it dynamically groups all workloads provisioned within the dev01 vSphere Namespace as they scale up or down. The  resource then attaches a baseline FirewallPolicy to this group, enforcing the namespace’s default security posture:
+The following Terraform script creates a dev01_namespace_group Group defined with dynamic matching criteria. Instead of maintaining static member lists, it dynamically groups all workloads provisioned within the dev01 vSphere Namespace as they scale up or down. The resource then attaches a baseline FirewallPolicy to this group, enforcing the namespace's default security posture:
 
 - Intra-Namespace (East-West): Allowed with Jump to Application catefory policies and rules.
 - Egress (Outbound): Allowed
@@ -593,7 +592,7 @@ resource "kubernetes_manifest" "namespace_segmentation_dev01" {
     apiVersion = "vpc.nsx.vmware.com/v1alpha1"
     kind       = "FirewallPolicy"
     metadata = {
-      name = "namespace-isolation-dev01"
+      name = "namespace-segmentation-dev01"
     }
     spec = {
       appliedTo  = { groupNames = [kubernetes_manifest.dev01_namespace_group.manifest.metadata.name] }
@@ -610,7 +609,6 @@ resource "kubernetes_manifest" "namespace_segmentation_dev01" {
           from      = [{ groupName = "dev01-namespace" }]
           to        = [{ groupName = "dev01-namespace" }]
           services  = [{ networkServiceName = "Any" }]
-          appliedTo  = { groupNames = [kubernetes_manifest.dev01_namespace_group.manifest.metadata.name] }
         },
         {
           name      = "allow-https-inbound"
@@ -619,7 +617,6 @@ resource "kubernetes_manifest" "namespace_segmentation_dev01" {
           from      = [{ groupName = "Any" }]
           to        = [{ groupName = "Any" }]
           services  = [{ networkServiceName = ":HTTPS" }]
-          appliedTo  = { groupNames = [kubernetes_manifest.dev01_namespace_group.manifest.metadata.name] }
         },
         {
           name      = "block-any-inbound"
@@ -628,7 +625,6 @@ resource "kubernetes_manifest" "namespace_segmentation_dev01" {
           from      = [{ groupName = "Any" }]
           to        = [{ groupName = "Any" }]
           services  = [{ networkServiceName = "Any" }]
-          appliedTo  = { groupNames = [kubernetes_manifest.dev01_namespace_group.manifest.metadata.name] }
         }
       ]
     }
@@ -809,5 +805,5 @@ Terraform's periodic `apply` is this paper's default, but it isn't the only vali
 - VMware Cloud Foundation Blog — [VMware Virtual Private Cloud in VCF 9.0](https://blogs.vmware.com/cloud-foundation/2025/07/02/vmware-virtual-private-cloud/)
 - VMware Cloud Foundation Blog — [VCF Automation IaC: Cloud Consumption Interface (CCI)](https://blogs.vmware.com/cloud-foundation/2024/11/05/vmware-cloud-foundation-vcf-automation-infrastructure-as-code-iac-cloud-consumption-interface-cci/)
 - VMware Cloud Foundation Blog — [VCF 9.1 Networking: Simpler VPC Connectivity Control](https://blogs.vmware.com/cloud-foundation/2026/05/15/vcf-networking-9-1-simpler-vpc-connectivity-control/)
-- HashiCorp / VMware — [Terraform Provider for VMware Aria Automation / VCF Automation (`vra`)](https://github.com/vmware/terraform-provider-vra)
+- VMware / Broadcom — [Terraform Provider for VMware Cloud Foundation Automation (`vcfa`)](https://github.com/vmware/terraform-provider-vcfa)
 - Argo CD Documentation — [ApplicationSet Controller](https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/)
