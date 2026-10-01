@@ -10,3 +10,21 @@ region_name          = "m01-reg01"
 tenant_vpc_name      = "prod01-vpc01"
 security_profile_name = "default-security-profile"
 monitoring_namespace = "monitoring01-8sg7f"
+
+tgw_name = "acme-prod-tgw"
+tgw_external_connections = {
+  corp-wan = {
+    attachment_name      = "corp-wan-attachment"
+    remote_cidrs         = ["10.0.0.0/8"]
+    inbound_target_group = "app01"
+    inbound_services     = [":HTTPS"]
+    outbound_services    = [":DNS", ":DNS-UDP"]
+  }
+  internet = {
+    attachment_name      = "internet-attachment"
+    remote_cidrs         = ["0.0.0.0/0"]
+    inbound_target_group = "app01"
+    inbound_services     = []
+    outbound_services    = [":HTTPS"]
+  }
+}

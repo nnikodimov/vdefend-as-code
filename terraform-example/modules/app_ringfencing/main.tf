@@ -47,7 +47,7 @@ resource "kubernetes_manifest" "app01_ringfencing" {
           name            = "allow-https-inbound"
           direction       = "In"
           action          = "Allow"
-          from            = [{ groupName = kubernetes_manifest.dev01_namespace_group.manifest.metadata.name }]
+          from            = [{ groupName = var.namespace_group_name }]
           sourcesExcluded = true
           to              = [{ groupName = "app01" }]
           services        = [{ networkServiceName = ":HTTPS" }]
@@ -64,5 +64,5 @@ resource "kubernetes_manifest" "app01_ringfencing" {
     }
   }
 
-  depends_on = [kubernetes_manifest.app01_group, kubernetes_manifest.dev01_namespace_group]
+  depends_on = [kubernetes_manifest.app01_group]
 }

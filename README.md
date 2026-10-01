@@ -18,14 +18,17 @@ Covers:
 
 ### 🧱 [`terraform-example/`](terraform-example/) — the working example
 
-A minimal Terraform module implementing §6 of the paper end-to-end against a real CCI endpoint: provider chain, Day-0 VPC security baseline, vSphere Namespace segmentation, and application ringfencing.
+A minimal Terraform module implementing §6 of the paper end-to-end against a real CCI endpoint: provider chain, Day-0 VPC security baseline, vSphere Namespace segmentation, application ringfencing, and Transit Gateway firewalling — each as its own module.
 
 | File | Implements | What it does |
 |---|---|---|
 | `providers.tf` | §6.1 | `vcfa` + `kubernetes` provider chain — mints a short-lived CCI kubeconfig via `vcfa_kubeconfig` and hands it to the `kubernetes` provider |
-| `security_baseline.tf` | §6.2 | Imports and patches the tenant VPC's existing `SecurityProfileAttachment` |
-| `namespace_segmentation.tf` | §6.3 | Dynamically groups a vSphere Namespace's workloads and applies a default-deny, HTTPS-only `FirewallPolicy` |
-| `app_ringfencing.tf` | §6.4 | Ringfences a protected-label application into its own `FirewallPolicy` |
+| `main.tf` | — | Root module: calls the four modules below and holds the `SecurityProfileAttachment` `import` block (import blocks are root-only) |
+| `modules/security_baseline/` | §6.2 | Patches the tenant VPC's existing `SecurityProfileAttachment` |
+| `modules/namespace_segmentation/` | §6.3 | Dynamically groups a vSphere Namespace's workloads and applies a default-deny, HTTPS-only `FirewallPolicy` |
+| `modules/app_ringfencing/` | §6.4 | Ringfences a protected-label application into its own `FirewallPolicy` |
+| `modules/tgw_firewall/` | §5.5 | One `TGWFirewallPolicy` per Transit Gateway external connection, plus the `TGWSecurityConfig` that enables it |
+| `moved.tf` | — | Moves state from the earlier flat layout to the module addresses |
 | `variables.tf` / `terraform.tfvars.example` | — | Input variables and an example `tfvars` file |
 
 #### Usage
