@@ -11,21 +11,23 @@ tenant_vpc_name      = "prod01-vpc01"
 security_profile_name = "system-security-profile-2--m01-reg01" # pick from: kubectl get securityprofiles
 monitoring_namespace = "monitoring01-8sg7f"
 
-# One entry per external connection. The module looks up the TGWAttachment from
-# transit_gateway_name; add external_connection_name if that TGW has more than one.
+# Firewall each external connection of one Transit Gateway with its own policy.
+# connection_name is the GatewayConnection / Distributed VLAN connection shown by
+# kubectl get tgwattachments; the module looks up the matching attachment.
+tgw_name = "tgw-prod"
 tgw_external_connections = {
-  prod-tier0 = {
-    transit_gateway_name = "tgw-prod"
-    remote_cidrs         = ["0.0.0.0/0"]
+  corp-wan = {
+    connection_name      = "corp-wan-attachment"
+    remote_cidrs         = ["10.255.255.0/24"]
     inbound_target_group = "app01"
     inbound_services     = [":HTTPS"]
-    outbound_services    = [":DNS", ":DNS-UDP", ":HTTPS"]
+    outbound_services    = [":DNS", ":DNS-UDP"]
   }
-  dev-tier0 = {
-    transit_gateway_name = "tgw-dev"
+  internet = {
+    connection_name      = "vcfa-connection-m01-ec01-tier0"
     remote_cidrs         = ["0.0.0.0/0"]
     inbound_target_group = "app01"
     inbound_services     = []
-    outbound_services    = [":DNS", ":DNS-UDP"]
+    outbound_services    = [":HTTPS"]
   }
 }
