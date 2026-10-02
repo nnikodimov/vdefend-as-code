@@ -1,5 +1,6 @@
 # providers.tf
 terraform {
+  required_version = ">= 1.6" # import blocks with expressions in id
   required_providers {
     vcfa = {
       source = "vmware/vcfa"

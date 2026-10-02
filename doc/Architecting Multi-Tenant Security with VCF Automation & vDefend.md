@@ -514,6 +514,7 @@ The authentication workflow relies on dynamic credential chaining across provide
 ```
 # providers.tf
 terraform {
+  required_version = ">= 1.6" # import blocks with expressions in id
   required_providers {
     vcfa = {
       source = "vmware/vcfa"
@@ -549,7 +550,7 @@ Every VPC gets a SecurityProfileAttachment automatically when it's provisioned, 
 # security_baseline.tf
 import {
   to = kubernetes_manifest.patch_profile_attachment
-  id = "apiVersion=vpc.nsx.vmware.com/v1alpha1,kind=SecurityProfileAttachment,var.tenant_vpc_name"
+  id = "apiVersion=vpc.nsx.vmware.com/v1alpha1,kind=SecurityProfileAttachment,name=${var.tenant_vpc_name}"
 }
 
 resource "kubernetes_manifest" "patch_profile_attachment" {

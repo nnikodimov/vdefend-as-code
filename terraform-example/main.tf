@@ -2,7 +2,7 @@
 
 import {
   to = module.security_baseline.kubernetes_manifest.patch_profile_attachment
-  id = "apiVersion=vpc.nsx.vmware.com/v1alpha1,kind=SecurityProfileAttachment,var.tenant_vpc_name"
+  id = "apiVersion=vpc.nsx.vmware.com/v1alpha1,kind=SecurityProfileAttachment,name=${var.tenant_vpc_name}"
 }
 
 module "security_baseline" {
