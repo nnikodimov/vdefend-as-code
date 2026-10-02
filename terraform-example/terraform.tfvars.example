@@ -11,17 +11,18 @@ tenant_vpc_name      = "prod01-vpc01"
 security_profile_name = "system-security-profile-2--m01-reg01" # pick from: kubectl get securityprofiles
 monitoring_namespace = "monitoring01-8sg7f"
 
-# One entry per external connection, keyed by TGWAttachment (kubectl get tgwattachments)
+# One entry per external connection. The module looks up the TGWAttachment from
+# transit_gateway_name; add external_connection_name if that TGW has more than one.
 tgw_external_connections = {
   prod-tier0 = {
-    attachment_name      = "tgw-prod:jjl9"
+    transit_gateway_name = "tgw-prod"
     remote_cidrs         = ["0.0.0.0/0"]
     inbound_target_group = "app01"
     inbound_services     = [":HTTPS"]
     outbound_services    = [":DNS", ":DNS-UDP", ":HTTPS"]
   }
   dev-tier0 = {
-    attachment_name      = "tgw-dev:gdwm"
+    transit_gateway_name = "tgw-dev"
     remote_cidrs         = ["0.0.0.0/0"]
     inbound_target_group = "app01"
     inbound_services     = []

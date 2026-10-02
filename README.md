@@ -27,7 +27,7 @@ A minimal Terraform module implementing §6 of the paper end-to-end against a re
 | `modules/security_baseline/` | §6.2 | Patches the tenant VPC's existing `SecurityProfileAttachment` |
 | `modules/namespace_segmentation/` | §6.3 | Dynamically groups a vSphere Namespace's workloads and applies a default-deny, HTTPS-only `FirewallPolicy` |
 | `modules/app_ringfencing/` | §6.4 | Ringfences a protected-label application into its own `FirewallPolicy` |
-| `modules/tgw_firewall/` | §5.5 | One `TGWFirewallPolicy` per Transit Gateway external connection (`TGWAttachment`), each rule scoped via `appliedTo.gatewayAttachmentNames` |
+| `modules/tgw_firewall/` | §5.5 | One `TGWFirewallPolicy` per Transit Gateway external connection. Reads the live `TGWAttachment` objects to resolve each connection, then scopes each rule via `appliedTo.gatewayAttachmentNames` |
 | `moved.tf` | — | Moves state from the earlier flat layout to the module addresses |
 | `variables.tf` / `terraform.tfvars.example` | — | Input variables and an example `tfvars` file |
 
