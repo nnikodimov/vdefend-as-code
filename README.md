@@ -27,7 +27,7 @@ A minimal Terraform module implementing §6 of the paper end-to-end against a re
 | `modules/security_baseline/` | §6.2 | Patches the tenant VPC's existing `SecurityProfileAttachment` |
 | `modules/namespace_segmentation/` | §6.3 | Dynamically groups a vSphere Namespace's workloads and applies a default-deny, HTTPS-only `FirewallPolicy` |
 | `modules/app_ringfencing/` | §6.4 | Ringfences a protected-label application into its own `FirewallPolicy` |
-| `modules/tgw_firewall/` | §5.5 | One `TGWFirewallPolicy` per Transit Gateway external connection, plus the `TGWSecurityConfig` that enables it |
+| `modules/tgw_firewall/` | §5.5 | One `TGWFirewallPolicy` per Transit Gateway external connection (`TGWAttachment`), each rule scoped via `appliedTo.gatewayAttachmentNames` |
 | `moved.tf` | — | Moves state from the earlier flat layout to the module addresses |
 | `variables.tf` / `terraform.tfvars.example` | — | Input variables and an example `tfvars` file |
 
@@ -53,7 +53,7 @@ terraform apply -target=module.security_baseline
 
 terraform apply -target=module.namespace_segmentation  # §6.3 — namespace group + segmentation FirewallPolicy
 terraform apply -target=module.app_ringfencing         # §6.4 — app01 group + ringfencing FirewallPolicy
-terraform apply -target=module.tgw_firewall            # §5.5 — TGWSecurityConfig + one TGWFirewallPolicy per external connection
+terraform apply -target=module.tgw_firewall            # §5.5 — one TGWFirewallPolicy per external connection
 ```
 
 To target several modules in one run, repeat the flag:
@@ -65,13 +65,13 @@ terraform apply -target=module.namespace_segmentation -target=module.app_ringfen
 To narrow a run to a single resource, including one instance of a `for_each` resource such as one external connection, use its full address. Quote it so the shell doesn't interpret the brackets:
 
 ```bash
-terraform apply -target='module.tgw_firewall.kubernetes_manifest.tgw_connection_policy["corp-wan"]'
+terraform apply -target='module.tgw_firewall.kubernetes_manifest.tgw_connection_policy["prod-tier0"]'
 ```
 
 Notes:
 
 - **Dependencies are pulled in automatically.** `app_ringfencing` takes the namespace group's name from `namespace_segmentation`, so `-target=module.app_ringfencing` also creates the `dev01-namespace` group. It does not create that module's `FirewallPolicy`.
-- **All root variables are still required.** Even a targeted run needs a complete `terraform.tfvars`, including `tgw_name` and `tgw_external_connections`.
+- **All root variables are still required.** Even a targeted run needs a complete `terraform.tfvars`, including `tgw_external_connections`.
 - **`-target` is for staged rollout and troubleshooting.** Once every module is in place, run a plain `terraform plan` / `terraform apply` so the whole configuration is checked for drift. Terraform prints a warning on every targeted run as a reminder.
 - **Be careful with destroy.** `terraform destroy -target=module.tgw_firewall` (or another module) removes only that module's objects. Don't destroy `module.security_baseline`, though: its `SecurityProfileAttachment` is a pre-existing object that Terraform imported and patched, not one it created. To stop managing it without deleting it, run `terraform state rm module.security_baseline` instead.
 

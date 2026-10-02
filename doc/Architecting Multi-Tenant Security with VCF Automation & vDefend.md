@@ -132,7 +132,7 @@ CCI presents the constructs discussed in §3 across a handful of API groups. Ten
 | project.cci.vmware.com/v1alpha2 | Tenant Project definition (the top-level multi-tenancy boundary) |
 | infrastructure.cci.vmware.com | Namespace classes, quotas, zone/region association — the guardrails a provider admin sets before self-service access |
 | authorization.cci.vmware.com | RBAC / role bindings scoped to a Project or namespace |
-| vpc.nsx.vmware.com/v1alpha1 | **Security APIs**: NetworkSecurityGroup/VPCNetworkSecurityGroup, NetworkService, SecurityProfile/SecurityProfileAttachment, FirewallPolicy, VPCGatewayFirewallPolicy, TGWFirewallPolicy/TGWSecurityConfig |
+| vpc.nsx.vmware.com/v1alpha1 | **Security APIs**: NetworkSecurityGroup/VPCNetworkSecurityGroup, NetworkService, SecurityProfile/SecurityProfileAttachment, FirewallPolicy, VPCGatewayFirewallPolicy, TGWFirewallPolicy |
 | vmoperator.vmware.com/v1alpha5 | VM lifecycle — the workloads the security policy protects |
 
 ### 4.3 Security Capabilities and the Kinds That Express Them
@@ -143,7 +143,7 @@ Each capability from §3.2 is addressed through one or two custom resource kinds
 | :---- | :---- | :---- |
 | Distributed Firewall | FirewallPolicy | East-west rules; spec.category sets evaluation order |
 | VPC Gateway Firewall | VPCGatewayFirewallPolicy | North-south, per-VPC; requires both a Region and a VPC reference |
-| Transit Gateway Firewall | TGWFirewallPolicy \+ TGWSecurityConfig | Inert until TGWSecurityConfig enables GatewayFirewall on the gateway |
+| Transit Gateway Firewall | TGWFirewallPolicy | Each rule's appliedTo is mandatory: gatewayNames scopes it to a whole TransitGateway, gatewayAttachmentNames to individual external connections (TGWAttachment) |
 | Security Profile | SecurityProfile \+ SecurityProfileAttachment | The profile is inert; the attachment binds it to a VPC |
 | Group | NetworkSecurityGroup (Region-scoped) / VPCNetworkSecurityGroup (VPC-scoped) | Gateway rules reference the VPC-scoped kind; DFW and TGW rules the Region-scoped one |
 | Service | NetworkService | Referenced by name from any rule's service list |
@@ -439,18 +439,9 @@ resources:
 
 Positioned at the Organization boundary, the Transit Gateway serves as the centralized enforcement point for all ingress and egress traffic. Consolidating north-south security controls at this layer governs permitted network paths while eliminating policy duplication across individual VPCs.
 
-In VCFA 9.1, the vDefend TGW Firewall exposes declarative, fine-grained traffic filtering via the TGWFirewallPolicy and TGWSecurityConfig CRDs, within the vpc.nsx.vmware.com/v1alpha1 API group. 
+In VCFA 9.1, the vDefend TGW Firewall exposes declarative, fine-grained traffic filtering via the TGWFirewallPolicy CRD, within the vpc.nsx.vmware.com/v1alpha1 API group. 
 
 ```
-apiVersion: vpc.nsx.vmware.com/v1alpha1
-kind: TGWSecurityConfig
-metadata:
-  name: acme-shared-tgw-security-config
-spec:
-  features:
-  - enabled: true
-    name: GatewayFirewall
----
 apiVersion: vpc.nsx.vmware.com/v1alpha1
 kind: TGWFirewallPolicy
 metadata:
@@ -474,6 +465,9 @@ spec:
     to:
     - groupName: shared-services
   - action: Drop
+    appliedTo:
+      gatewayNames:
+      - acme-prod-tgw
     direction: In
     from:
     - groupName: Any
@@ -490,6 +484,8 @@ spec:
 **Multi-Environment Connectivity and Targeted Policy Enforcement**
 
 VCF Organizations often require connections to distinct external environments, such as corporate data centers, partner networks, or the public Internet. These topology requirements can be met by deploying individual Transit Gateways for each environment or consolidating multiple external connections onto a single TGW. Using vDefend TGW Firewall capabilities, security administrators can enforce dedicated, environment-specific firewall policies tailored to the distinct security and compliance requirements of each external connection.  
+
+Each external connection is realized as a TGWAttachment that binds a Transit Gateway to a GatewayConnection (or a Distributed VLAN/VXLAN connection); kubectl get tgwattachments lists them, with names such as tgw-prod:jjl9. Scoping a rule with appliedTo.gatewayAttachmentNames instead of gatewayNames confines it to that single connection, so each connection can carry its own TGWFirewallPolicy without affecting the others. The modules/tgw\_firewall module in terraform-example/ implements this pattern, generating one policy per entry in a map of external connections.
 
 ---
 

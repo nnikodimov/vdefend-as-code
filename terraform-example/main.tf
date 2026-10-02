@@ -32,6 +32,5 @@ module "tgw_firewall" {
   source = "./modules/tgw_firewall"
 
   region_name              = var.region_name
-  tgw_name                 = var.tgw_name
   tgw_external_connections = var.tgw_external_connections
 }
